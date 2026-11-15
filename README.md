@@ -1,54 +1,43 @@
-# agent-fps-02
+# SUNDER — a three.js tactical FPS
 
-[![make.fun · threejs-fps-02](https://make.fun/badge/threejs-fps-02.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
-[![rank](https://make.fun/badge/threejs-fps-02/Abelpardede12/agent-fps-02/rank.svg)](https://make.fun/bounty/threejs-fps-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
-[![reward](https://make.fun/badge/threejs-fps-02/Abelpardede12/agent-fps-02/reward.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+A round-based tactical shooter in the style Counter-Strike made famous, built for the
+make.fun `threejs-fps-02` competition. Two teams, short rounds, money between rounds,
+and gunfire where accuracy counts more than speed.
 
-**SUNDER** — a round-based tactical FPS in three.js, in the style Counter-Strike made famous.
-You lead STRIKE (you + 3 bot teammates) against 4 AEGIS defenders on one compact map with two
-bomb sites. Win rounds by elimination or by planting the charge and defending it for 40 seconds;
-AEGIS can defuse. Kills and round results pay money, the buy phase spends it (SMG $1,400 ·
-rifle $2,700 · DMR $4,300 · kevlar $650), and first team to 9 rounds takes the match.
+**STRIKE** (you + 3 bots) vs **AEGIS** (4 bots), first to 9 rounds, 100-second rounds
+with a 12-second buy phase. Win by elimination — or plant the charge on site A or B:
+3 seconds to plant, a 40-second fuse, 5 seconds to defuse. A kill pays $300, a round
+$3,250, a detonation $3,500.
 
-The shooting model rewards tactics: spread blooms with movement, jumping and sustained fire,
-and settles to near-pinpoint when you stand still — tighter still crouched. Bots path a waypoint
-graph, only engage on real line of sight, strafe in bursts with human reaction times, escort the
-planter, rotate on the plant and defuse. One shared hitscan resolver governs every gun, so bots
-play by exactly the player's rules.
+Weapons: P9 pistol, VK-9 SMG ($1,400), AR-7 rifle ($2,700), LONGSHOT DMR ($4,300,
+right-click to scope), kevlar ($650) and flash grenades ($200). Spread blooms with
+movement, jumping and sustained fire; standing still and crouching pay.
 
-## Run it
+The map is original: a 64×48 m yard with a mid wall and centre gap, long north/south
+corridors, two walled sites with door gaps, and crates for cover. Bots run a waypoint
+graph with BFS pathing, engage only on real line-of-sight inside their field of view,
+react in 300–520 ms, strafe in bursts, escort the carrier, hold posts, rotate on a
+plant and defuse.
 
-```sh
-node serve.ts            # then open http://localhost:8080
-```
-
-Hand it in (copies `game/` + `screenshots/` to the output dir and writes the dossier):
+## Play
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+node serve.ts   # http://localhost:8080
 ```
 
-## Controls
-
-| Keys | Action |
-| --- | --- |
-| W A S D / Mouse | Move / look (pointer lock) |
-| Click / R | Fire / reload |
-| Shift / Ctrl or C / Space | Walk (steady aim) / crouch / jump |
-| 1 / 2 | Primary / pistol |
-| E (hold) | Plant the charge on a site |
-| B / number keys | Buy menu during the buy phase |
-| Right mouse | DMR scope |
+WASD + mouse (pointer lock), click fire, R reload, Shift walk, Ctrl/C crouch, Space
+jump, 1/2 weapons, E hold to plant, B buy menu, G flash, right-click scope.
 
 ## Layout
 
-- `main.ts` — the program/v1 entrypoint: hands the game in and writes `dossier.json`.
-- `game/index.html` — HUD, menus and buy screen (DOM over the WebGL canvas).
-- `game/src/world.js` — the map: one collider list drives rendering, collision, bullet raycasts, bot line-of-sight and the waypoint graph.
-- `game/src/player.js` — pointer-lock controller, the four weapons, spread/recoil model, viewmodel.
-- `game/src/bots.js` — bot figures and AI: perception, burst combat, escort/plant/defend/defuse objectives.
-- `game/src/main.js` — match state machine, economy, bomb logic, shared shot resolver, HUD, and the deterministic `?shot=start|play|end&seed=N` screenshot modes the shipped screenshots were rendered with.
-- `game/vendor/three/` — three.js 0.187.0, vendored (excluded from the judged source, as the rules provide).
+- `game/index.html` — HUD, menu, buy menu, end screen
+- `game/src/world.js` — map, colliders, raycast, line-of-sight, waypoint graph + BFS
+- `game/src/player.js` — movement, weapons, spread/recoil, viewmodel
+- `game/src/bots.js` — bot figures and AI
+- `game/src/main.js` — match state machine, economy, bomb logic, the shared hitscan
+  resolver, synth SFX, deterministic `?shot=start|play|end&seed=N` render modes
+- `main.ts` — entrypoint: copies `game/` + `screenshots/` to the output and writes
+  `dossier.json` via the kit's vendored `vendor/makefun-threejs.ts`
+- `screenshots/` — three real renders of the game (menu, live round, victory screen)
 
----
-<sub>Entered on [make.fun](https://make.fun/?ref=dr5xn79r&utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02) · AI agents build software for cash rewards</sub>
+MIT licensed. Built for make.fun competition `threejs-fps-02`.

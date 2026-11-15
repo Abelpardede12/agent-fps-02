@@ -1,326 +1,364 @@
-// bots.js — the other seven operators. Each bot is a simple articulated
-// figure (legs, torso, head, gun) driven by a small state machine:
-// follow the team's plan, path along the waypoint graph, and when an enemy
-// is seen — really seen, line of sight and field of view — stop, strafe and
-// fire disciplined bursts with human-ish reaction time and aim error.
-// Attackers push a site and plant; defenders hold posts, then retake and
-// defuse once the charge is down. Nobody shoots through walls: perception
-// uses the same LOS test as the bullets.
-
+// SUNDER — bots.js
+// The seven bot opponents/teammates: their figures and their AI. One job: make a bot
+// that moves through the map, sees, reacts and shoots back — and plays the objective.
+// Bots share the map, the waypoint graph and the shot resolver with the player.
 import * as THREE from 'three';
-import { collide, findPath, losClear, SITES } from './world.js';
-import { WEAPONS, freshWeapon } from './player.js';
+import { WEAPONS } from './player.js';
+import { SITES as SITES_OF, findPath, hasLOS, inSite, moveCircle } from './world.js';
 
-const TEAM_COLORS = {
-  strike: { torso: 0xc77f2a, trim: 0xffb340, legs: 0x3a3f47 },
-  aegis: { torso: 0x3f5a78, trim: 0xff5a4e, legs: 0x2c313a },
-};
+export const BOT_EYE = 1.55;
+const BOT_RADIUS = 0.4;
 
-let botSeq = 0;
+const NAMES_STRIKE = ['VEX', 'ORIN', 'KESS'];
+const NAMES_AEGIS = ['HALD', 'MIRA', 'SORREN', 'TAMSIN'];
+
+const SPEEDS = { P9: 4.4, VK9: 4.2, AR7: 3.8, LONGSHOT: 3.2 };
+
+// How a bot aims: angular error in radians, shrinks the longer it sees its target.
+function aimError(bot, dist, targetSpeed) {
+  const base = bot.skill * 0.032 + dist * 0.0006 + targetSpeed * 0.004;
+  const settle = Math.max(0.3, 1 - bot.seenFor * 0.8);
+  return base * settle;
+}
 
 export class Bot {
-  constructor(scene, world, team, name) {
-    this.id = botSeq++;
-    this.kind = 'bot';
-    this.team = team;
+  constructor(id, team, name, color) {
+    this.id = id;
+    this.team = team; // 'strike' | 'aegis'
     this.name = name;
-    this.world = world;
-    this.pos = new THREE.Vector3();
+    this.color = color;
+    this.pos = new THREE.Vector3(0, 0, 0);
     this.yaw = 0;
     this.hp = 100;
     this.armor = false;
     this.alive = true;
-    this.weapon = freshWeapon(WEAPONS.p9);
-    this.path = [];
-    this.pathI = 0;
-    this.objective = null;      // {x, z} current strategic target
-    this.postPos = null;        // defender hold position
-    this.thinkAt = 0;
+    this.kills = 0;
+    this.deaths = 0;
+    this.weaponId = 'P9';
+    this.mag = 12;
+    this.cooldown = 0;
+    this.reloadTimer = 0;
+    this.skill = 0.6 + Math.random() * 0.5; // 0.6..1.1, higher = worse aim
+    // AI state
+    this.state = 'idle'; // idle | move | engage | plant | defuse | hold
+    this.path = null;
+    this.pathIdx = 0;
     this.repathAt = 0;
-    this.visibleEnemy = null;
-    this.lastKnown = null;
-    this.lastSeenAt = -1e9;
-    this.reactionAt = 0;
+    this.objective = null; // {x, z, kind}
+    this.target = null; // agent currently engaged
+    this.seenFor = 0;
+    this.reactAt = 0;
     this.burstLeft = 0;
-    this.nextShotAt = 0;
-    this.burstPauseUntil = 0;
-    this.reloadUntil = 0;
+    this.burstTimer = 0;
     this.strafeDir = 1;
-    this.strafeFlipAt = 0;
-    this.channeling = false;    // planting or defusing; set by main
-    this.deadAt = 0;
-    this.fallT = 0;
-    this.skill = { reaction: 300 + Math.random() * 220, aimSigma: 0.030 + Math.random() * 0.012 };
-    this.buildMesh(scene, team);
+    this.strafeAt = 0;
+    this.blindUntil = 0;
+    this.lastKnown = null; // {x, z} of last shooter / seen enemy
+    this.plantProgress = 0;
+    this.defuseProgress = 0;
+    this.stuckAt = 0;
+    this.stuckPos = new THREE.Vector3();
+    this.post = null; // hold position {x, z}
+    this.mesh = this.buildMesh();
   }
 
-  buildMesh(scene, team) {
-    const c = TEAM_COLORS[team];
+  buildMesh() {
     const g = new THREE.Group();
-    const mat = (color, rough = 0.8) => new THREE.MeshStandardMaterial({ color, roughness: rough });
-    this.mats = { torso: mat(c.torso), legs: mat(c.legs), head: mat(0xc9a183, 0.65), dark: mat(0x1d2025, 0.6) };
-    const legL = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.52, 0.2), this.mats.legs);
-    legL.position.set(-0.11, 0.26, 0);
-    const legR = legL.clone(); legR.position.x = 0.11;
-    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.62, 0.3), this.mats.torso);
-    torso.position.y = 0.83;
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.09, 0.31), mat(c.trim, 0.5));
-    stripe.position.y = 1.02;
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.27, 0.27, 0.27), this.mats.head);
-    head.position.y = 1.36;
-    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.07, 0.02), this.mats.dark);
-    visor.position.set(0, 1.39, -0.14);
-    const gun = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.1, 0.62), this.mats.dark);
-    gun.position.set(0.18, 1.06, -0.3);
-    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.4, 0.11), this.mats.torso);
-    arm.position.set(0.18, 0.98, -0.08);
-    arm.rotation.x = -0.7;
-    g.add(legL, legR, torso, stripe, head, visor, gun, arm);
-    g.traverse((o) => { if (o.isMesh) o.castShadow = true; });
-    this.mesh = g;
-    this.legL = legL; this.legR = legR;
-    scene.add(g);
+    const suit = new THREE.MeshStandardMaterial({ color: this.color, roughness: 0.7, metalness: 0.15 });
+    const dark = new THREE.MeshStandardMaterial({ color: 0x22242a, roughness: 0.8, metalness: 0.2 });
+    const visor = new THREE.MeshStandardMaterial({ color: 0x101418, roughness: 0.25, metalness: 0.7 });
+    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.72, 0.32), dark);
+    legs.position.y = 0.36;
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.72, 0.38), suit);
+    torso.position.y = 1.06;
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.32, 0.34), dark);
+    head.position.y = 1.6;
+    const visorM = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.1, 0.05), visor);
+    visorM.position.set(0, 1.62, -0.17);
+    const gun = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.1, 0.62), dark);
+    gun.position.set(0.2, 1.15, -0.3);
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.06, 0.4),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: this.color, emissiveIntensity: 0.5 }));
+    stripe.position.y = 1.28;
+    g.add(legs, torso, head, visorM, gun, stripe);
+    g.userData.head = head;
+    g.userData.torso = torso;
+    return g;
   }
 
-  reset(spawn, weaponId, armor) {
-    this.pos.set(spawn.x, 0, spawn.z);
-    this.yaw = spawn.yaw;
+  resetRound(x, z, yaw, weaponId, armor) {
+    this.pos.set(x, 0, z);
+    this.yaw = yaw;
     this.hp = 100;
+    this.armor = armor;
     this.alive = true;
-    this.armor = !!armor;
-    this.weapon = freshWeapon(WEAPONS[weaponId] || WEAPONS.p9);
-    this.path = []; this.pathI = 0;
-    this.objective = null;
-    this.visibleEnemy = null; this.lastKnown = null;
-    this.channeling = false;
-    this.fallT = 0; this.deadAt = 0;
-    this.mesh.rotation.set(0, this.yaw, 0);
-    this.mesh.position.copy(this.pos);
+    this.weaponId = weaponId;
+    this.mag = WEAPONS[weaponId].mag;
+    this.cooldown = 0;
+    this.reloadTimer = 0;
+    this.state = 'idle';
+    this.path = null;
+    this.target = null;
+    this.seenFor = 0;
+    this.burstLeft = 0;
+    this.blindUntil = 0;
+    this.plantProgress = 0;
+    this.defuseProgress = 0;
     this.mesh.visible = true;
-    for (const m of Object.values(this.mats)) { m.transparent = false; m.opacity = 1; }
+    this.mesh.rotation.set(0, yaw, 0);
+    this.mesh.position.set(x, 0, z);
   }
 
-  eyePos() { return new THREE.Vector3(this.pos.x, 1.5, this.pos.z); }
-  chestPos() { return new THREE.Vector3(this.pos.x, 1.0, this.pos.z); }
+  weapon() { return WEAPONS[this.weaponId]; }
 
-  // Sphere test used by the shared shot resolver: head, chest, legs.
-  rayHit(origin, dir, maxDist) {
-    const parts = [
-      { y: 1.38, r: 0.21, head: true },
-      { y: 0.92, r: 0.40, head: false },
-      { y: 0.38, r: 0.36, head: false },
-    ];
-    let best = null;
-    for (const p of parts) {
-      const cx = this.pos.x, cy = p.y, cz = this.pos.z;
-      const ox = cx - origin.x, oy = cy - origin.y, oz = cz - origin.z;
-      const t = ox * dir.x + oy * dir.y + oz * dir.z;
-      if (t < 0 || t > maxDist) continue;
-      const px = origin.x + dir.x * t, py = origin.y + dir.y * t, pz = origin.z + dir.z * t;
-      const d2 = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2;
-      if (d2 <= p.r * p.r && (!best || t < best.dist)) best = { dist: t, head: p.head };
-    }
-    return best;
-  }
+  eyePos() { return new THREE.Vector3(this.pos.x, BOT_EYE, this.pos.z); }
 
-  takeDamage(amount) {
-    if (!this.alive) return false;
-    const dmg = this.armor ? amount * 0.55 : amount;
+  takeDamage(amount, isHead) {
+    if (!this.alive) return 0;
+    let dmg = amount;
+    if (this.armor) dmg *= isHead ? 0.7 : 0.55;
     this.hp -= dmg;
-    if (this.hp <= 0) {
-      this.hp = 0; this.alive = false;
-      this.deadAt = performance.now();
-      return true;
+    if (this.hp <= 0) { this.hp = 0; this.alive = false; this.deaths += 1; }
+    return dmg;
+  }
+
+  die() {
+    this.alive = false;
+    this.mesh.rotation.set(0, this.yaw, Math.PI / 2);
+    this.mesh.position.y = 0.25;
+  }
+
+  setObjective(kind, x, z) {
+    if (!this.objective || this.objective.kind !== kind || this.objective.x !== x || this.objective.z !== z) {
+      this.objective = { kind, x, z };
+      this.path = null;
     }
+  }
+
+  followPath(dt, ctx, speed) {
+    if (!this.path || this.pathIdx >= this.path.length) return true; // arrived
+    const wp = this.path[this.pathIdx];
+    const dx = wp.x - this.pos.x, dz = wp.z - this.pos.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.6) { this.pathIdx += 1; return this.pathIdx >= this.path.length; }
+    const vx = (dx / d) * speed, vz = (dz / d) * speed;
+    const moved = moveCircle(this.pos.x, this.pos.z, vx * dt, vz * dt, BOT_RADIUS, ctx.colliders);
+    this.pos.x = moved.x;
+    this.pos.z = moved.z;
+    this.yaw = Math.atan2(-vx, -vz);
     return false;
   }
 
-  setObjective(x, z, now) {
-    if (this.objective && Math.hypot(this.objective.x - x, this.objective.z - z) < 0.5 && this.path.length) return;
-    this.objective = { x, z };
-    this.path = findPath(this.world.nodes, this.pos.x, this.pos.z, x, z);
-    this.pathI = 0;
-    this.repathAt = now + 2600;
-  }
-
-  update(dt, now, ctx) {
-    if (!this.alive) {
-      // Death: topple, then sink away after a few seconds.
-      if (this.fallT < 1) {
-        this.fallT = Math.min(1, this.fallT + dt * 2.6);
-        this.mesh.rotation.x = -Math.PI / 2 * this.fallT;
-        this.mesh.position.y = -0.1 * this.fallT;
-      } else if (now - this.deadAt > 4200) {
-        this.mesh.position.y = Math.max(-1.7, this.mesh.position.y - dt * 0.5);
-      }
-      return;
-    }
-    this.mesh.position.copy(this.pos);
-    this.mesh.rotation.y = this.yaw;
-
-    if (this.channeling) return; // planting/defusing: rooted, main runs the clock
-
-    if (now >= this.thinkAt) {
-      this.thinkAt = now + 110 + Math.random() * 40;
-      this.perceive(now, ctx);
-      this.decide(now, ctx);
-    }
-    this.act(dt, now, ctx);
-  }
-
-  perceive(now, ctx) {
+  // Pick the best visible enemy: real line-of-sight, inside a 100-degree cone, < 45 m.
+  scanEnemies(ctx) {
     const eye = this.eyePos();
     let best = null, bestD = Infinity;
-    for (const e of ctx.enemies) {
-      if (!e.alive) continue;
-      const ep = e.kind === 'player' ? e.eyePos() : e.chestPos();
-      const d = Math.hypot(ep.x - eye.x, ep.z - eye.z);
-      if (d > 58) continue;
-      // Field of view: 110°, unless the enemy is close enough to hear.
-      const ang = Math.atan2(-(ep.x - eye.x), -(ep.z - eye.z));
-      let da = Math.abs(((ang - this.yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
-      if (da > 1.9 && d > 6) continue;
-      if (!losClear(ctx.colliders, eye.x, eye.z, ep.x, ep.z)) continue;
-      if (d < bestD) { bestD = d; best = e; }
+    for (const other of ctx.agents) {
+      if (other === this || !other.alive || other.team === this.team) continue;
+      const op = other.eyePos ? other.eyePos() : other.pos;
+      const dx = op.x - eye.x, dy = op.y - eye.y, dz = op.z - eye.z;
+      const d = Math.hypot(dx, dy, dz);
+      if (d > 45 || d < 0.5) continue;
+      const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);
+      const dot = (dx * fx + dz * fz) / d;
+      if (dot < 0.25) continue; // outside ~100-degree field of view
+      if (!hasLOS(eye.x, eye.y, eye.z, op.x, op.y - 0.25, op.z, ctx.colliders)) continue;
+      if (d < bestD) { bestD = d; best = other; }
     }
-    if (best) {
-      if (this.visibleEnemy !== best) this.reactionAt = now + this.skill.reaction;
-      this.visibleEnemy = best;
-      this.lastKnown = { x: best.pos.x, z: best.pos.z };
-      this.lastSeenAt = now;
-    } else if (now - this.lastSeenAt > 2600) {
-      this.visibleEnemy = null;
-    }
+    return best ? { enemy: best, dist: bestD } : null;
   }
 
-  decide(now, ctx) {
-    const g = ctx.game;
-    if (this.visibleEnemy) return; // combat is handled in act()
-    if (this.team === 'strike') {
-      if (g.bombState === 'planted') {
-        // Defend the charge: hold a ring around the site.
-        const s = SITES[g.bombSite];
-        const slot = ctx.defendSlot(this, s);
-        this.setObjective(slot.x, slot.z, now);
-      } else if (g.planter === this && g.bombState === 'carried') {
-        const s = SITES[g.targetSite];
-        this.setObjective(s.x, s.z, now);
-        if (Math.hypot(this.pos.x - s.x, this.pos.z - s.z) < 2.2) ctx.requestPlant(this);
-      } else if (g.bombState === 'dropped' && g.bombPos) {
-        // The charge is on the ground: go and pick it up.
-        this.setObjective(g.bombPos.x, g.bombPos.z, now);
-      } else if (this.lastKnown && now - this.lastSeenAt < 5000) {
-        this.setObjective(this.lastKnown.x, this.lastKnown.z, now);
+  update(dt, ctx) {
+    const now = ctx.now;
+    if (!this.alive) return;
+    this.cooldown = Math.max(0, this.cooldown - dt);
+    if (this.reloadTimer > 0) {
+      this.reloadTimer -= dt;
+      if (this.reloadTimer <= 0) this.mag = this.weapon().mag;
+    }
+    const blinded = now < this.blindUntil;
+    // --- perception ---
+    const seen = blinded ? null : this.scanEnemies(ctx);
+    if (seen) {
+      if (this.target !== seen.enemy) {
+        this.target = seen.enemy;
+        this.seenFor = 0;
+        this.reactAt = now + 0.3 + ctx.rng() * 0.22; // 300-520 ms reaction
+        this.burstLeft = 0;
       } else {
-        // Escort: move with the push toward the target site, fanned out.
-        const s = SITES[g.targetSite];
-        const slot = ctx.escortSlot(this, s);
-        this.setObjective(slot.x, slot.z, now);
+        this.seenFor += dt;
+      }
+      const tp = seen.enemy.pos;
+      this.lastKnown = { x: tp.x, z: tp.z };
+    } else if (this.target) {
+      this.seenFor = 0;
+      if (this.target.alive === false) this.target = null;
+      else if (now - (this.targetSeenAt || 0) > 1.2) this.target = null;
+    }
+    if (seen) this.targetSeenAt = now;
+
+    // --- combat: strafe bursts once reacted ---
+    if (this.target && this.target.alive && !blinded && now >= this.reactAt) {
+      this.state = 'engage';
+      const tp = this.target.pos;
+      const dx = tp.x - this.pos.x, dz = tp.z - this.pos.z;
+      const d = Math.hypot(dx, dz);
+      const wantYaw = Math.atan2(-dx, -dz);
+      this.yaw = wantYaw;
+      if (now > this.strafeAt) { this.strafeDir *= -1; this.strafeAt = now + 0.5 + ctx.rng() * 0.7; }
+      // Strafe sideways while firing, slow down to aim.
+      const px = -dz / (d || 1), pz = dx / (d || 1);
+      const sp = SPEEDS[this.weaponId] * 0.45;
+      const moved = moveCircle(this.pos.x, this.pos.z,
+        px * this.strafeDir * sp * dt, pz * this.strafeDir * sp * dt, BOT_RADIUS, ctx.colliders);
+      this.pos.x = moved.x; this.pos.z = moved.z;
+      if (this.burstLeft <= 0 && this.burstTimer <= 0) {
+        this.burstLeft = 4 + Math.floor(ctx.rng() * 3);
+        this.burstTimer = 0.45 + ctx.rng() * 0.45;
+      }
+      if (this.burstLeft > 0 && this.cooldown <= 0 && this.reloadTimer <= 0) {
+        if (this.mag <= 0) {
+          this.reloadTimer = this.weapon().reload;
+          this.burstLeft = 0;
+        } else {
+          const w = this.weapon();
+          const err = aimError(this, d, this.target.speed2d || 0);
+          const spread = (this.weaponId === 'LONGSHOT' ? 0.004 : w.spread * 1.2) + err;
+          const eye = this.eyePos();
+          const aimAt = new THREE.Vector3(tp.x, tp.y + 1.2, tp.z);
+          const dir = aimAt.sub(eye).normalize();
+          const yaw = Math.atan2(-dir.x, -dir.z) + (ctx.rng() * 2 - 1) * spread;
+          const pitch = Math.asin(Math.max(-1, Math.min(1, dir.y))) + (ctx.rng() * 2 - 1) * spread;
+          const shot = new THREE.Vector3(
+            -Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch));
+          ctx.shoot(this, eye, shot, this.weaponId);
+          this.mag -= 1;
+          this.cooldown = 60 / w.rpm;
+          this.burstLeft -= 1;
+          if (this.burstLeft <= 0) this.burstTimer = 0.5 + ctx.rng() * 0.5;
+        }
+      }
+      this.burstTimer = Math.max(0, this.burstTimer - dt);
+      this.syncMesh();
+      return;
+    }
+    this.burstTimer = Math.max(0, this.burstTimer - dt);
+
+    // --- objective behaviour ---
+    if (blinded) {
+      // Flashed: hold still, no shooting.
+      this.syncMesh();
+      return;
+    }
+    const bomb = ctx.bomb;
+    if (this.team === 'strike') {
+      if (bomb.state === 'planted') {
+        // Guard the planted charge: hold inside the site.
+        const site = SITES_OF[bomb.site];
+        this.setObjective('hold', site.cx + (ctx.rng() - 0.5) * 4, site.cz + (ctx.rng() - 0.5) * 3);
+        this.moveToObjective(dt, ctx);
+      } else if (bomb.carrier === this && bomb.state === 'carried') {
+        // Carry to the assigned site and plant.
+        const site = SITES_OF[this.siteKey];
+        if (inSite(site, this.pos.x, this.pos.z)) {
+          this.state = 'plant';
+          this.plantProgress += dt;
+          this.faceSiteCentre(site);
+          if (this.plantProgress >= 3) ctx.onPlant(this);
+        } else {
+          this.setObjective('site', site.cx, site.cz);
+          this.moveToObjective(dt, ctx);
+        }
+      } else if (bomb.state === 'dropped') {
+        this.setObjective('charge', bomb.pos.x, bomb.pos.z);
+        this.moveToObjective(dt, ctx);
+        if (Math.hypot(bomb.pos.x - this.pos.x, bomb.pos.z - this.pos.z) < 1.4) ctx.onPickup(this);
+      } else {
+        // Escort the carrier (or the player carrier): trail 4 m behind.
+        const c = ctx.carrierAgent();
+        if (c && c !== this) {
+          const ox = c.pos.x - 4 * Math.sin(c.yaw || 0), oz = c.pos.z - 4 * Math.cos(c.yaw || 0);
+          this.setObjective('escort', ox, oz);
+          this.moveToObjective(dt, ctx);
+        } else {
+          const site = SITES_OF[this.siteKey];
+          this.setObjective('site', site.cx, site.cz);
+          this.moveToObjective(dt, ctx);
+        }
       }
     } else {
       // AEGIS
-      if (g.bombState === 'planted') {
-        const bp = g.bombPos;
-        if (Math.hypot(this.pos.x - bp.x, this.pos.z - bp.z) < 1.4) ctx.requestDefuse(this);
-        else this.setObjective(bp.x, bp.z, now);
-      } else if (g.bombState === 'dropped' && g.bombPos) {
-        // Camp the dropped charge from a few metres out.
-        const a = (this.id * 1.7) % (Math.PI * 2);
-        this.setObjective(g.bombPos.x + Math.cos(a) * 6, g.bombPos.z + Math.sin(a) * 6, now);
-      } else if (this.lastKnown && now - this.lastSeenAt < 5000) {
-        this.setObjective(this.lastKnown.x, this.lastKnown.z, now);
-      } else if (this.postPos) {
-        this.setObjective(this.postPos.x, this.postPos.z, now);
+      if (bomb.state === 'planted') {
+        if (Math.hypot(bomb.pos.x - this.pos.x, bomb.pos.z - this.pos.z) < 1.8) {
+          this.state = 'defuse';
+          this.defuseProgress += dt;
+          if (this.defuseProgress >= 5) ctx.onDefuse(this);
+        } else {
+          this.setObjective('bomb', bomb.pos.x, bomb.pos.z);
+          this.moveToObjective(dt, ctx);
+        }
+      } else if (this.post) {
+        // Hold the assigned post; rotate to the other site on plant handled above.
+        if (Math.hypot(this.post.x - this.pos.x, this.post.z - this.pos.z) > 1.2) {
+          this.setObjective('post', this.post.x, this.post.z);
+          this.moveToObjective(dt, ctx);
+        } else {
+          this.state = 'hold';
+          this.yaw += dt * 0.25; // slow scan
+        }
       }
     }
-    if (now >= this.repathAt && this.objective) {
-      this.path = findPath(this.world.nodes, this.pos.x, this.pos.z, this.objective.x, this.objective.z);
-      this.pathI = 0;
-      this.repathAt = now + 2600;
-    }
+    this.syncMesh();
   }
 
-  act(dt, now, ctx) {
-    const enemy = this.visibleEnemy;
-    if (enemy && enemy.alive) {
-      // Face the enemy, strafe in short jinks, fire bursts once reacted.
-      const ep = enemy.kind === 'player' ? enemy.eyePos() : enemy.chestPos();
-      const wantYaw = Math.atan2(-(ep.x - this.pos.x), -(ep.z - this.pos.z));
-      this.turnToward(wantYaw, dt * 9);
-      const dist = Math.hypot(ep.x - this.pos.x, ep.z - this.pos.z);
-      if (now >= this.strafeFlipAt) {
-        this.strafeFlipAt = now + 650 + Math.random() * 800;
-        this.strafeDir = Math.random() < 0.5 ? -1 : 1;
-        if (dist < 7) this.strafeDir = 0; // too close: hold and shoot
+  moveToObjective(dt, ctx) {
+    this.state = 'move';
+    if (!this.path || ctx.now > this.repathAt) {
+      const o = this.objective;
+      this.path = findPath(ctx.graph, this.pos.x, this.pos.z, o.x, o.z);
+      this.pathIdx = 0;
+      this.repathAt = ctx.now + 2.5;
+      this.stuckAt = ctx.now;
+      this.stuckPos.copy(this.pos);
+    }
+    const arrived = this.followPath(dt, ctx, SPEEDS[this.weaponId]);
+    if (arrived) this.path = null;
+    // Stuck detection: barely moved in 2 s -> repath with a jittered target.
+    if (ctx.now - this.stuckAt > 2) {
+      const moved = Math.hypot(this.pos.x - this.stuckPos.x, this.pos.z - this.stuckPos.z);
+      if (moved < 0.3 && this.objective) {
+        const o = this.objective;
+        this.path = findPath(ctx.graph, this.pos.x, this.pos.z,
+          o.x + (ctx.rng() - 0.5) * 6, o.z + (ctx.rng() - 0.5) * 6);
+        this.pathIdx = 0;
       }
-      if (this.strafeDir !== 0) {
-        const px = Math.cos(this.yaw) * this.strafeDir, pz = -Math.sin(this.yaw) * this.strafeDir;
-        this.move(px, pz, 2.1, dt);
-      }
-      this.combatFire(now, ctx, enemy, dist);
-      return;
-    }
-    // Travel along the path.
-    if (this.pathI < this.path.length) {
-      const t = this.path[this.pathI];
-      const dx = t.x - this.pos.x, dz = t.z - this.pos.z;
-      const d = Math.hypot(dx, dz);
-      if (d < 0.75) { this.pathI++; return; }
-      const wantYaw = Math.atan2(-dx, -dz);
-      this.turnToward(wantYaw, dt * 7);
-      this.move(dx / d, dz / d, 4.6, dt);
-      // Walk cycle: swing the legs while travelling.
-      const sw = Math.sin(now * 0.011) * 0.5;
-      this.legL.rotation.x = sw; this.legR.rotation.x = -sw;
-    } else {
-      this.legL.rotation.x = 0; this.legR.rotation.x = 0;
-      // Holding a post: scan slowly.
-      if (this.team === 'aegis' && !this.objective) return;
-      this.yaw += Math.sin(now * 0.0006 + this.id * 2.1) * dt * 0.25;
+      this.stuckAt = ctx.now;
+      this.stuckPos.copy(this.pos);
     }
   }
 
-  combatFire(now, ctx, enemy, dist) {
-    const w = this.weapon;
-    if (this.reloadUntil) {
-      if (now >= this.reloadUntil) {
-        const need = w.def.mag - w.mag;
-        const take = Math.min(need, w.reserve);
-        w.mag += take; w.reserve -= take;
-        this.reloadUntil = 0;
-      } else return;
-    }
-    if (now < this.reactionAt || now < this.burstPauseUntil) return;
-    if (w.mag <= 0) { this.reloadUntil = now + w.def.reloadMs; return; }
-    if (now < this.nextShotAt) return;
-    this.nextShotAt = now + w.def.rofMs;
-    if (this.burstLeft <= 0) this.burstLeft = 3 + (Math.random() * 3 | 0);
-    this.burstLeft--;
-    if (this.burstLeft === 0) this.burstPauseUntil = now + 380 + Math.random() * 420;
-    w.mag -= 1;
-    // Aim at chest, sometimes the head; error grows with range and target speed.
-    const target = enemy.kind === 'player' ? enemy.eyePos() : enemy.chestPos();
-    target.y -= enemy.kind === 'player' ? 0.28 : 0;
-    if (Math.random() < 0.22) target.y += 0.42; // head attempt
-    const origin = this.eyePos(); origin.y -= 0.12;
-    const dir = target.sub(origin).normalize();
-    const sigma = this.skill.aimSigma * (dist > 25 ? 1.35 : 1);
-    dir.x += (Math.random() + Math.random() - 1) * sigma;
-    dir.y += (Math.random() + Math.random() - 1) * sigma * 0.7;
-    dir.z += (Math.random() + Math.random() - 1) * sigma;
-    dir.normalize();
-    ctx.events.shoot(this, origin, dir, w);
+  faceSiteCentre(site) {
+    const dx = site.cx - this.pos.x, dz = site.cz - this.pos.z;
+    this.yaw = Math.atan2(-dx, -dz);
   }
 
-  turnToward(want, speed) {
-    let d = ((want - this.yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
-    this.yaw += THREE.MathUtils.clamp(d, -speed, speed);
+  syncMesh() {
+    this.mesh.position.set(this.pos.x, 0, this.pos.z);
+    this.mesh.rotation.set(0, this.yaw, 0);
   }
+}
 
-  move(dx, dz, speed, dt) {
-    const nx = this.pos.x + dx * speed * dt;
-    const nz = this.pos.z + dz * speed * dt;
-    const [cx, cz] = collide(this.world.colliders, nx, nz, 0.45);
-    this.pos.x = cx; this.pos.z = cz;
-  }
+export function makeBots(scene) {
+  const bots = [];
+  NAMES_STRIKE.forEach((n, i) => {
+    const b = new Bot(`s${i}`, 'strike', n, 0xf0a830);
+    scene.add(b.mesh);
+    bots.push(b);
+  });
+  NAMES_AEGIS.forEach((n, i) => {
+    const b = new Bot(`a${i}`, 'aegis', n, 0x35c4b5);
+    scene.add(b.mesh);
+    bots.push(b);
+  });
+  return bots;
 }

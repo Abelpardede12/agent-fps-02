@@ -1,318 +1,275 @@
-// player.js — first-person controller, weapon definitions and the viewmodel.
-// The accuracy model is the game's thesis: a shot's spread cone grows with
-// movement, jumping and sustained fire, and shrinks to near-nothing when you
-// stand still — and tighter still crouched. Rifles reward the patient shot.
-
+// SUNDER — player.js
+// The human player: pointer-lock look, acceleration movement, weapons, spread and
+// recoil, and the first-person viewmodel. One job: the body the player drives.
 import * as THREE from 'three';
-import { collide } from './world.js';
+import { moveCircle } from './world.js';
 
+export const EYE_STAND = 1.62;
+export const EYE_CROUCH = 1.12;
+export const PLAYER_RADIUS = 0.4;
+
+// damage, head multiplier, fire rate, magazine, spread (radians), bloom per shot,
+// kick (radians of pitch), reload seconds, price, zoom FOV (0 = none).
 export const WEAPONS = {
-  p9: {
-    id: 'p9', name: 'P9 SIDEARM', slot: 2, price: 0,
-    damage: 26, headMult: 3.0, rofMs: 270, auto: false,
-    mag: 12, reserveStart: 48, reloadMs: 1150, range: 70,
-    spreadStill: 0.007, spreadMove: 0.030, bloomPerShot: 0.006, kick: 0.5,
-    tracer: 0xffd9a0,
+  P9: {
+    name: 'P9', price: 0, damage: 26, headMult: 2, rpm: 380, mag: 12, reserve: 48,
+    spread: 0.011, bloom: 0.006, kick: 0.006, reload: 1.1, range: 60, auto: false, zoom: 0,
   },
-  vk9: {
-    id: 'vk9', name: 'VK-9 SMG', slot: 1, price: 1400,
-    damage: 22, headMult: 2.6, rofMs: 88, auto: true,
-    mag: 30, reserveStart: 90, reloadMs: 1750, range: 60,
-    spreadStill: 0.013, spreadMove: 0.042, bloomPerShot: 0.004, kick: 0.35,
-    tracer: 0xffc98a,
+  VK9: {
+    name: 'VK-9 SMG', price: 1400, damage: 24, headMult: 2, rpm: 750, mag: 28, reserve: 84,
+    spread: 0.017, bloom: 0.004, kick: 0.004, reload: 1.6, range: 55, auto: true, zoom: 0,
   },
-  ar7: {
-    id: 'ar7', name: 'AR-7 RIFLE', slot: 1, price: 2700,
-    damage: 34, headMult: 3.0, rofMs: 112, auto: true,
-    mag: 30, reserveStart: 90, reloadMs: 1950, range: 110,
-    spreadStill: 0.0035, spreadMove: 0.052, bloomPerShot: 0.005, kick: 0.6,
-    tracer: 0xffe2b0,
+  AR7: {
+    name: 'AR-7', price: 2700, damage: 33, headMult: 2, rpm: 600, mag: 25, reserve: 75,
+    spread: 0.009, bloom: 0.005, kick: 0.008, reload: 2.0, range: 70, auto: true, zoom: 0,
   },
-  longshot: {
-    id: 'longshot', name: 'LONGSHOT DMR', slot: 1, price: 4300,
-    damage: 98, headMult: 2.0, rofMs: 1350, auto: false,
-    mag: 5, reserveStart: 25, reloadMs: 2600, range: 160,
-    spreadStill: 0.0012, spreadMove: 0.075, bloomPerShot: 0.01, kick: 1.6,
-    zoomFov: 24, tracer: 0xfff3d0,
+  LONGSHOT: {
+    name: 'LONGSHOT', price: 4300, damage: 88, headMult: 2, rpm: 55, mag: 5, reserve: 15,
+    spread: 0.05, scopedSpread: 0.0016, bloom: 0.02, kick: 0.03, reload: 2.8, range: 90,
+    auto: false, zoom: 30,
   },
 };
 
-export class Input {
-  constructor(dom) {
-    this.keys = new Set();
-    this.mouseDX = 0; this.mouseDY = 0;
-    this.firing = false; this.firePressed = false;
-    this.scoping = false;
-    this.locked = false;
-    this.enabled = false;
-    const el = dom;
-    document.addEventListener('keydown', (e) => {
-      if (['Space', 'ControlLeft', 'KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(e.code)) e.preventDefault();
-      if (!e.repeat) this.keys.add(e.code);
-    });
-    document.addEventListener('keyup', (e) => this.keys.delete(e.code));
-    document.addEventListener('mousemove', (e) => {
-      if (!this.locked || !this.enabled) return;
-      this.mouseDX += e.movementX || 0;
-      this.mouseDY += e.movementY || 0;
-    });
-    document.addEventListener('mousedown', (e) => {
-      if (!this.locked || !this.enabled) return;
-      if (e.button === 0) { this.firing = true; this.firePressed = true; }
-      if (e.button === 2) this.scoping = true;
-    });
-    document.addEventListener('mouseup', (e) => {
-      if (e.button === 0) this.firing = false;
-      if (e.button === 2) this.scoping = false;
-    });
-    document.addEventListener('contextmenu', (e) => e.preventDefault());
-    document.addEventListener('pointerlockchange', () => {
-      this.locked = document.pointerLockElement === el;
-      if (!this.locked) { this.firing = false; this.scoping = false; }
-    });
-    this.dom = el;
-  }
-  lock() {
-    // Returns a promise in newer Chrome; a refusal (no gesture yet) just
-    // means the next canvas click will lock instead.
-    try { this.dom.requestPointerLock?.()?.catch?.(() => {}); } catch { /* not fatal */ }
-  }
-  consumeMouse() {
-    const d = { dx: this.mouseDX, dy: this.mouseDY };
-    this.mouseDX = 0; this.mouseDY = 0;
-    return d;
-  }
-  down(...codes) { return codes.some((c) => this.keys.has(c)); }
-}
+export const KEVLAR_PRICE = 650;
+export const FLASH_PRICE = 200;
+export const START_MONEY = 800;
+export const MAX_MONEY = 16000;
+export const KILL_REWARD = 300;
+export const ROUND_WIN = 3250;
+export const DETONATION_WIN = 3500;
+export const ROUND_LOSS = 1400;
 
-const GRAVITY = -19;
-const EYE_STAND = 1.62, EYE_CROUCH = 1.06;
+const WALK_SPEED = 5.0;
+const CROUCH_SPEED = 2.2;
+const SLOW_SPEED = 2.4; // Shift: walk quietly, steadier aim
+const ACCEL = 42;
+const FRICTION = 11;
+const JUMP_VEL = 5.4;
+const GRAVITY = 14.5;
 
 export class Player {
-  constructor(scene, camera, world, input) {
+  constructor(camera) {
     this.camera = camera;
-    this.world = world;
-    this.input = input;
-    this.pos = new THREE.Vector3(-28, 0, 0);
+    this.pos = new THREE.Vector3(-28, 0, 0); // feet position
     this.vel = new THREE.Vector3();
-    this.yaw = Math.PI / 2; this.pitch = 0;
-    this.hp = 100; this.armor = false; this.alive = true;
-    this.onGround = true; this.crouching = false;
-    this.eye = EYE_STAND;
-    this.bloom = 0; this.kickPitch = 0; this.lastShotAt = -1e9;
-    this.reloadingUntil = 0; this.reloadWeapon = null;
-    this.loadout = { primary: null, pistol: freshWeapon(WEAPONS.p9), current: 'pistol' };
-    this.events = { shoot() {}, dryFire() {}, reloadStart() {}, reloadEnd() {}, scoped() {} };
-    this.buildViewmodel(scene);
+    this.yaw = -Math.PI / 2; // facing +x (east, toward mid)
+    this.pitch = 0;
+    this.onGround = true;
+    this.crouched = false;
+    this.scoped = false;
+    this.hp = 100;
+    this.armor = false;
+    this.money = START_MONEY;
+    this.alive = true;
+    this.kills = 0;
+    this.deaths = 0;
+    this.owned = { P9: { mag: 12, reserve: 48 } };
+    this.slots = ['P9']; // 1 = primary slot, 2 = pistol
+    this.current = 'P9';
+    this.grenades = 0;
+    this.bloom = 0;
+    this.recoil = 0; // extra pitch, decays
+    this.cooldown = 0;
+    this.reloadTimer = 0;
+    this.bobPhase = 0;
+    this.speed2d = 0;
+    this.viewmodel = this.buildViewmodel();
+    camera.add(this.viewmodel);
   }
 
-  buildViewmodel(scene) {
-    this.gun = new THREE.Group();
-    const dark = new THREE.MeshStandardMaterial({ color: 0x22252a, roughness: 0.55, metalness: 0.45 });
-    const mid = new THREE.MeshStandardMaterial({ color: 0x3a3f47, roughness: 0.5, metalness: 0.5 });
-    const grip = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.8 });
-    this.gunBody = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.11, 0.46), mid);
-    this.gunBody.position.set(0, -0.02, -0.1);
-    this.gunBarrel = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.05, 0.34), dark);
-    this.gunBarrel.position.set(0, 0.015, -0.46);
-    this.gunGrip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.16, 0.08), grip);
-    this.gunGrip.position.set(0, -0.13, 0.02);
-    this.gunGrip.rotation.x = 0.25;
-    this.gunMag = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.15, 0.07), dark);
-    this.gunMag.position.set(0, -0.13, -0.16);
-    this.gunSight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.05, 0.02), dark);
-    this.gunSight.position.set(0, 0.075, -0.3);
-    this.flash = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.34, 0.34),
-      new THREE.MeshBasicMaterial({ color: 0xffca7a, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }),
-    );
-    this.flash.position.set(0, 0.015, -0.66);
-    this.flashLight = new THREE.PointLight(0xffb45e, 0, 9);
-    this.flashLight.position.set(0, 0, -0.6);
-    this.gun.add(this.gunBody, this.gunBarrel, this.gunGrip, this.gunMag, this.gunSight, this.flash, this.flashLight);
-    this.gun.position.set(0.22, -0.21, -0.45);
-    this.gun.scale.setScalar(0.85);
-    this.camera.add(this.gun);
-    scene.add(this.camera);
+  get eyeY() { return this.pos.y + (this.crouched ? EYE_CROUCH : EYE_STAND); }
+
+  weapon() { return WEAPONS[this.current]; }
+
+  ammo() { return this.owned[this.current]; }
+
+  buildViewmodel() {
+    const g = new THREE.Group();
+    const dark = new THREE.MeshStandardMaterial({ color: 0x1d1f24, roughness: 0.55, metalness: 0.6 });
+    const mid = new THREE.MeshStandardMaterial({ color: 0x3c4149, roughness: 0.6, metalness: 0.4 });
+    const accent = new THREE.MeshStandardMaterial({ color: 0xf0a830, roughness: 0.5, metalness: 0.3 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.42), dark);
+    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.3), mid);
+    barrel.position.set(0, 0.02, -0.32);
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.16, 0.09), dark);
+    grip.position.set(0, -0.12, 0.14);
+    grip.rotation.x = 0.35;
+    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.05, 0.06), accent);
+    sight.position.set(0, 0.09, -0.05);
+    const flash = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.16),
+      new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0, depthWrite: false }));
+    flash.position.set(0, 0.02, -0.5);
+    g.add(body, barrel, grip, sight, flash);
+    g.position.set(0.24, -0.22, -0.45);
+    g.userData.flash = flash;
+    return g;
   }
 
-  setWeaponVisual(id) {
-    // One viewmodel, re-proportioned per weapon class.
-    const long = id === 'longshot', rifle = id === 'ar7', smg = id === 'vk9';
-    this.gunBarrel.scale.z = long ? 1.7 : rifle ? 1.25 : smg ? 0.9 : 0.55;
-    this.gunBody.scale.z = long || rifle ? 1.25 : smg ? 1.05 : 0.62;
-    this.gunBody.scale.y = id === 'p9' ? 0.8 : 1;
-    this.gunMag.visible = id !== 'p9';
-    this.gunSight.visible = id !== 'p9';
-  }
-
-  spawn(spawn) {
-    this.pos.set(spawn.x, 0, spawn.z);
+  resetRound(spawn, yaw) {
+    this.pos.set(spawn[0], 0, spawn[1]);
     this.vel.set(0, 0, 0);
-    this.yaw = spawn.yaw; this.pitch = 0;
-    this.hp = 100; this.alive = true;
-    this.bloom = 0; this.kickPitch = 0;
-    this.reloadingUntil = 0;
+    this.yaw = yaw;
+    this.pitch = 0;
+    this.hp = 100;
+    this.alive = true;
+    this.bloom = 0;
+    this.recoil = 0;
+    this.reloadTimer = 0;
+    this.cooldown = 0;
+    this.scoped = false;
+    // Keep owned weapons across rounds; refill reserve on buy in main.
   }
 
-  get weapon() {
-    const slot = this.loadout.current;
-    return slot === 'primary' ? this.loadout.primary : this.loadout.pistol;
+  resetMatch() {
+    this.money = START_MONEY;
+    this.kills = 0;
+    this.deaths = 0;
+    this.owned = { P9: { mag: 12, reserve: 48 } };
+    this.slots = ['P9'];
+    this.current = 'P9';
+    this.grenades = 0;
+    this.armor = false;
   }
 
-  givePrimary(id) {
-    this.loadout.primary = freshWeapon(WEAPONS[id]);
-    this.loadout.current = 'primary';
-    this.setWeaponVisual(id);
+  // Returns true if a shot was fired (caller resolves the hitscan).
+  tryFire(now) {
+    if (!this.alive || this.cooldown > 0 || this.reloadTimer > 0) return false;
+    const w = this.weapon();
+    const a = this.ammo();
+    if (a.mag <= 0) return false;
+    a.mag -= 1;
+    this.cooldown = 60 / w.rpm;
+    this.bloom = Math.min(0.05, this.bloom + w.bloom);
+    this.recoil = Math.min(0.12, this.recoil + w.kick);
+    this.viewmodel.userData.flash.material.opacity = 0.9;
+    return true;
   }
 
-  switchTo(slot) {
-    if (slot === 'primary' && !this.loadout.primary) return;
-    if (this.loadout.current === slot) return;
-    this.loadout.current = slot;
-    this.reloadingUntil = 0;
-    this.setWeaponVisual(this.weapon.def.id);
+  startReload() {
+    const w = this.weapon();
+    const a = this.ammo();
+    if (this.reloadTimer > 0 || a.mag >= w.mag || a.reserve <= 0) return false;
+    this.reloadTimer = w.reload;
+    return true;
   }
 
-  eyePos() {
-    return new THREE.Vector3(this.pos.x, this.pos.y + this.eye, this.pos.z);
-  }
-
-  // Current spread (radians of cone half-angle) for the held weapon.
-  spread() {
-    const w = this.weapon; if (!w) return 0.02;
-    const moving = Math.hypot(this.vel.x, this.vel.z) > 0.6;
-    let s = moving ? w.def.spreadMove : w.def.spreadStill;
-    if (!this.onGround) s = Math.max(s, 0.085);
-    if (this.crouching) s *= 0.6;
-    if (this.input.down('ShiftLeft', 'ShiftRight') && moving) s *= 0.7;
-    if (w.def.zoomFov && this.input.scoping) s = Math.min(s, 0.0012);
-    if (w.def.zoomFov && !this.input.scoping) s = Math.max(s, 0.05);
+  // Spread in radians for the next shot: near-pinpoint standing still, worse moving,
+  // in the air, or after sustained fire; tighter crouched. Scope steadies the DMR.
+  currentSpread() {
+    const w = this.weapon();
+    let s = (this.current === 'LONGSHOT' && this.scoped) ? w.scopedSpread : w.spread;
+    s *= 1 + this.speed2d * 0.32;
+    if (this.crouched) s *= 0.7;
+    if (!this.onGround) s *= 2.2;
     return s + this.bloom;
   }
 
-  spreadPixels() {
-    return 4 + this.spread() * 900;
+  // Direction of the next shot, with spread applied.
+  shotDirection() {
+    const s = this.currentSpread();
+    const yaw = this.yaw + (Math.random() * 2 - 1) * s;
+    const pitch = this.pitch + this.recoil + (Math.random() * 2 - 1) * s;
+    return new THREE.Vector3(
+      -Math.sin(yaw) * Math.cos(pitch),
+      Math.sin(pitch),
+      -Math.cos(yaw) * Math.cos(pitch),
+    );
   }
 
-  update(dt, now) {
-    const inp = this.input;
-    const m = inp.consumeMouse();
-    if (inp.enabled && inp.locked) {
-      this.yaw -= m.dx * 0.00205;
-      this.pitch -= m.dy * 0.00205;
-      this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch));
-    }
-    this.crouching = inp.down('ControlLeft', 'ControlRight', 'KeyC');
-    const targetEye = this.crouching ? EYE_CROUCH : EYE_STAND;
-    this.eye += (targetEye - this.eye) * Math.min(1, dt * 11);
+  eyePos() {
+    return new THREE.Vector3(this.pos.x, this.eyeY, this.pos.z);
+  }
 
-    const walking = inp.down('ShiftLeft', 'ShiftRight');
-    const speed = this.crouching ? 2.3 : walking ? 2.7 : 5.4;
-    const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
-    let fx = 0, fz = 0;
-    if (inp.enabled) {
-      if (inp.down('KeyW')) { fx -= sin; fz -= cos; }
-      if (inp.down('KeyS')) { fx += sin; fz += cos; }
-      if (inp.down('KeyA')) { fx -= cos; fz += sin; }
-      if (inp.down('KeyD')) { fx += cos; fz -= sin; }
-    }
-    const len = Math.hypot(fx, fz);
-    if (len > 0) { fx /= len; fz /= len; }
-    const accel = this.onGround ? 14 : 2.5;
-    this.vel.x += (fx * speed - this.vel.x) * Math.min(1, dt * accel);
-    this.vel.z += (fz * speed - this.vel.z) * Math.min(1, dt * accel);
-    if (inp.enabled && inp.down('Space') && this.onGround) {
-      this.vel.y = 6.4; this.onGround = false;
-    }
-    this.vel.y += GRAVITY * dt;
-    this.pos.x += this.vel.x * dt;
-    this.pos.z += this.vel.z * dt;
-    this.pos.y += this.vel.y * dt;
-    if (this.pos.y <= 0) { this.pos.y = 0; this.vel.y = 0; this.onGround = true; }
-    const [cx, cz] = collide(this.world.colliders, this.pos.x, this.pos.z, 0.45);
-    this.pos.x = cx; this.pos.z = cz;
+  takeDamage(amount, isHead) {
+    if (!this.alive) return 0;
+    let dmg = amount;
+    if (this.armor) dmg *= isHead ? 0.7 : 0.55; // kevlar soaks body shots, less on head
+    this.hp -= dmg;
+    if (this.hp <= 0) { this.hp = 0; this.alive = false; this.deaths += 1; }
+    return dmg;
+  }
 
-    // Camera + recoil recovery.
-    this.kickPitch *= Math.pow(0.0001, dt); // fast decay
-    this.camera.position.copy(this.eyePos());
-    this.camera.rotation.order = 'YXZ';
-    this.camera.rotation.set(this.pitch + this.kickPitch, this.yaw, 0);
-    const targetFov = (this.weapon?.def.zoomFov && inp.scoping) ? this.weapon.def.zoomFov : 75;
-    if (Math.abs(this.camera.fov - targetFov) > 0.1) {
-      this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, dt * 12);
-      this.camera.updateProjectionMatrix();
-    }
-    this.gun.visible = !(this.weapon?.def.zoomFov && inp.scoping);
-
-    // Bloom recovery + muzzle flash decay.
-    this.bloom = Math.max(0, this.bloom - dt * 0.028);
-    if (this.flash.material.opacity > 0) {
-      this.flash.material.opacity = Math.max(0, this.flash.material.opacity - dt * 9);
-      this.flashLight.intensity = this.flash.material.opacity * 14;
-    }
-    // Reload completion.
-    if (this.reloadingUntil && now >= this.reloadingUntil) {
-      const w = this.weapon;
-      const need = w.def.mag - w.mag;
-      const take = Math.min(need, w.reserve);
-      w.mag += take; w.reserve -= take;
-      this.reloadingUntil = 0;
-      this.events.reloadEnd();
-    }
-    this.gun.position.y = -0.21 + (this.reloadingUntil ? -0.13 : 0) + Math.sin(now * 0.0022) * 0.0022;
-    this.gun.rotation.x = this.reloadingUntil ? 0.5 : this.kickPitch * 0.6;
-
-    // Firing.
-    if (inp.enabled && inp.locked && this.alive) {
-      const w = this.weapon;
-      if (w) {
-        const wantFire = w.def.auto ? inp.firing : inp.firePressed;
-        if (wantFire && !this.reloadingUntil) this.tryFire(now);
-        if (inp.firePressed && w.mag === 0 && !this.reloadingUntil) this.events.dryFire();
+  update(dt, input, colliders) {
+    if (!this.alive) return;
+    this.cooldown = Math.max(0, this.cooldown - dt);
+    this.bloom = Math.max(0, this.bloom - dt * 0.045);
+    this.recoil = Math.max(0, this.recoil - dt * 0.25);
+    if (this.reloadTimer > 0) {
+      this.reloadTimer -= dt;
+      if (this.reloadTimer <= 0) {
+        const w = this.weapon();
+        const a = this.ammo();
+        const need = w.mag - a.mag;
+        const take = Math.min(need, a.reserve);
+        a.mag += take;
+        a.reserve -= take;
       }
     }
-    inp.firePressed = false;
-  }
+    // Look.
+    this.yaw -= input.lookX * 0.0023 * (this.scoped ? 0.45 : 1);
+    this.pitch -= input.lookY * 0.0023 * (this.scoped ? 0.45 : 1);
+    this.pitch = Math.max(-1.52, Math.min(1.52, this.pitch));
+    input.lookX = 0; input.lookY = 0;
 
-  startReload(now) {
-    const w = this.weapon;
-    if (!w || this.reloadingUntil || w.mag >= w.def.mag || w.reserve <= 0) return;
-    this.reloadingUntil = now + w.def.reloadMs;
-    this.events.reloadStart();
-  }
+    this.crouched = input.crouch;
+    // Move: acceleration toward wish direction, friction when idle.
+    const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
+    let wx = 0, wz = 0;
+    if (input.forward) { wx -= sin; wz -= cos; }
+    if (input.back) { wx += sin; wz += cos; }
+    if (input.left) { wx -= cos; wz += sin; }
+    if (input.right) { wx += cos; wz -= sin; }
+    const wl = Math.hypot(wx, wz);
+    if (wl > 0) { wx /= wl; wz /= wl; }
+    const targetSpeed = this.crouched ? CROUCH_SPEED : (input.walk ? SLOW_SPEED : WALK_SPEED);
+    const accelRate = this.onGround ? ACCEL : ACCEL * 0.35;
+    this.vel.x += wx * accelRate * dt;
+    this.vel.z += wz * accelRate * dt;
+    if (wl === 0 && this.onGround) {
+      const f = Math.max(0, 1 - FRICTION * dt);
+      this.vel.x *= f; this.vel.z *= f;
+    }
+    const sp = Math.hypot(this.vel.x, this.vel.z);
+    if (sp > targetSpeed) {
+      const k = targetSpeed / sp;
+      this.vel.x *= k; this.vel.z *= k;
+    }
+    this.speed2d = Math.hypot(this.vel.x, this.vel.z);
 
-  tryFire(now) {
-    const w = this.weapon;
-    if (now - this.lastShotAt < w.def.rofMs) return;
-    if (w.mag <= 0) { this.startReload(now); return; }
-    this.lastShotAt = now;
-    w.mag -= 1;
-    const sp = this.spread();
-    this.bloom = Math.min(0.05, this.bloom + w.def.bloomPerShot);
-    this.kickPitch += 0.0035 * w.def.kick * (this.crouching ? 0.8 : 1);
-    // Direction: camera forward with a uniform random cone of half-angle sp.
-    const dir = new THREE.Vector3(0, 0, -1).applyEuler(this.camera.rotation);
-    const a = Math.random() * Math.PI * 2;
-    const r = Math.sqrt(Math.random()) * sp;
-    const right = new THREE.Vector3(1, 0, 0).applyEuler(this.camera.rotation);
-    const up = new THREE.Vector3(0, 1, 0).applyEuler(this.camera.rotation);
-    dir.addScaledVector(right, Math.cos(a) * r).addScaledVector(up, Math.sin(a) * r).normalize();
-    this.flash.material.opacity = 0.85;
-    this.flash.rotation.z = Math.random() * Math.PI;
-    this.events.shoot(this.eyePos(), dir, w);
-    if (w.mag === 0) this.startReload(now);
-  }
+    const moved = moveCircle(this.pos.x, this.pos.z,
+      this.vel.x * dt, this.vel.z * dt, PLAYER_RADIUS, colliders);
+    this.pos.x = moved.x;
+    this.pos.z = moved.z;
 
-  takeDamage(amount) {
-    if (!this.alive) return false;
-    const dmg = this.armor ? amount * 0.55 : amount;
-    this.hp -= dmg;
-    if (this.hp <= 0) { this.hp = 0; this.alive = false; return true; }
-    return false;
-  }
-}
+    if (input.jump && this.onGround) {
+      this.vel.y = JUMP_VEL;
+      this.onGround = false;
+    }
+    this.vel.y -= GRAVITY * dt;
+    this.pos.y += this.vel.y * dt;
+    if (this.pos.y <= 0) { this.pos.y = 0; this.vel.y = 0; this.onGround = true; }
 
-export function freshWeapon(def) {
-  return { def, mag: def.mag, reserve: def.reserveStart };
+    // Camera + viewmodel.
+    this.bobPhase += this.speed2d * dt * 1.6;
+    const bob = Math.min(1, this.speed2d / WALK_SPEED) * 0.012;
+    this.camera.position.set(this.pos.x, this.eyeY + Math.sin(this.bobPhase * 2) * bob, this.pos.z);
+    this.camera.rotation.set(0, 0, 0);
+    this.camera.rotateY(this.yaw);
+    this.camera.rotateX(this.pitch + this.recoil);
+    const vm = this.viewmodel;
+    vm.visible = !this.scoped;
+    const kick = this.recoil * 1.6;
+    vm.position.set(
+      0.24 + Math.sin(this.bobPhase) * bob * 0.4,
+      -0.22 + Math.abs(Math.cos(this.bobPhase)) * bob * 0.5,
+      -0.45 + kick,
+    );
+    vm.rotation.x = kick * 0.9;
+    vm.userData.flash.material.opacity = Math.max(0, vm.userData.flash.material.opacity - dt * 14);
+    const targetFov = this.scoped ? 30 : 90;
+    if (Math.abs(this.camera.fov - targetFov) > 0.5) {
+      this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, dt * 14);
+      this.camera.updateProjectionMatrix();
+    }
+  }
 }

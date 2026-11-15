@@ -1,8 +1,9 @@
-// serve.ts — a small static file server for playing the game locally.
-//   node serve.ts [--port 8080]   then open http://localhost:8080
-// It serves only the game/ directory, refuses paths that escape it, and
-// exists purely as a development convenience (Node standard library only).
-
+// SUNDER — serve.ts
+// A tiny static server for game/ (Node 22, standard library only), so the game can be
+// played locally without a build step: `node serve.ts` serves game/ on
+// http://localhost:8080 (or --port <n>). Development convenience only: it serves files
+// under game/, refuses anything outside it, and sends the MIME types a browser game
+// needs.
 import { createReadStream, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
@@ -10,11 +11,11 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
 const args = process.argv.slice(2);
-const at = args.indexOf('--port');
-const wanted = at === -1 ? 8080 : Number(args[at + 1]);
+const portArg = args.indexOf('--port');
+const wanted = portArg === -1 ? 8080 : Number(args[portArg + 1]);
 const port = Number.isInteger(wanted) && wanted > 0 && wanted < 65536 ? wanted : 8080;
 
-const TYPES: Record<string, string> = {
+const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -25,35 +26,36 @@ const TYPES: Record<string, string> = {
   '.jpeg': 'image/jpeg',
 };
 
-createServer((req, res) => {
-  let path: string;
+createServer((request, response) => {
+  const url = new URL(request.url ?? '/', 'http://localhost');
+  let pathname;
   try {
-    path = decodeURIComponent(new URL(req.url ?? '/', 'http://localhost').pathname);
+    pathname = decodeURIComponent(url.pathname);
   } catch {
-    res.writeHead(400).end('bad request');
+    response.writeHead(400).end('bad request');
     return;
   }
-  if (path.endsWith('/')) path += 'index.html';
-  const file = resolve(join(root, normalize(path)));
+  if (pathname.endsWith('/')) pathname += 'index.html';
+  const file = resolve(join(root, normalize(pathname)));
   if (file !== root && !file.startsWith(root + sep)) {
-    res.writeHead(403).end('forbidden');
+    response.writeHead(403).end('forbidden');
     return;
   }
-  let size: number;
+  let size;
   try {
-    const st = statSync(file);
-    if (!st.isFile()) throw new Error('not a file');
-    size = st.size;
+    const stats = statSync(file);
+    if (!stats.isFile()) throw new Error('not a file');
+    size = stats.size;
   } catch {
-    res.writeHead(404).end('not found');
+    response.writeHead(404).end('not found');
     return;
   }
-  res.writeHead(200, {
-    'content-type': TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
+  response.writeHead(200, {
+    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
     'content-length': size,
     'cache-control': 'no-store',
   });
-  createReadStream(file).pipe(res);
+  createReadStream(file).pipe(response);
 }).listen(port, '127.0.0.1', () => {
-  console.log(`SUNDER dev server: http://localhost:${port}`);
+  console.log(`game/ is on http://localhost:${port}`);
 });
