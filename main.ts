@@ -1,6 +1,6 @@
-// SUNDER — entrypoint (Node 22, standard library only).
-// Hands the game in: copies this repository's game/ and screenshots/ beside this file
-// into the output directory and writes dossier.json with the kit's vendored library.
+// main.ts — SUNDER entrypoint (Node 22, standard library only).
+// Copies game/ and screenshots/ beside this file into the output directory
+// and writes /output/dossier.json with the kit's vendored buildDossier.
 // Outside the grader, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -18,8 +18,6 @@ if (existsSync(join(here, 'screenshots'))) {
   cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
 }
 
-// Caps from the competition gate: judged source text at most 160 KiB, screenshots at
-// most 4 files of 256 KiB each, game/ at most 993 files and 48 MiB in all.
 writeFileSync(
   join(out, 'dossier.json'),
   buildDossier(out, {
@@ -29,3 +27,4 @@ writeFileSync(
     game_max_bytes: 50331648,
   }),
 );
+console.log('wrote', join(out, 'dossier.json'));

@@ -1,893 +1,635 @@
-// SUNDER — main.js
-// The match: state machine, economy, the charge, the one shared hitscan resolver
-// player and bots both shoot through, WebAudio synth SFX, HUD, and the deterministic
-// ?shot= render modes the screenshots use. Fixed-step simulation, rendering apart.
+// main.js — SUNDER: a round-based tactical FPS in three.js.
+// One Game owns the state (match, economy, bomb, HUD); the simulation runs
+// on a fixed 60 Hz step apart from rendering. Player and bots fire through
+// the same resolver (resolveShot), so a hit is a hit whoever pulled it.
+// Deterministic render modes for screenshots: ?shot=start (menu),
+// ?shot=play (live round), ?shot=end (victory screen), with &seed=N.
 import * as THREE from 'three';
-import {
-  buildGraph, buildMap, hasLOS, inSite, mulberry32, rayHit, SITES, SPAWNS,
-} from './world.js';
-import {
-  DETONATION_WIN, FLASH_PRICE, KEVLAR_PRICE, KILL_REWARD, MAX_MONEY,
-  Player, ROUND_LOSS, ROUND_WIN, START_MONEY, WEAPONS,
-} from './player.js';
-import { makeBots } from './bots.js';
-
-window.__errors = [];
-window.addEventListener('error', (e) => window.__errors.push(String(e.message || e.error)));
-window.addEventListener('unhandledrejection', (e) => window.__errors.push(String(e.reason)));
+import { buildScene, buildWaypoints, raycast, hasLOS, SITE_A, SITE_B, SITE_R, SPAWN_STRIKE, SPAWN_AEGIS } from './world.js';
+import { Player, WEAPONS, KEVLAR_PRICE } from './player.js';
+import { Bot } from './bots.js';
 
 const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const params = new URLSearchParams(location.search);
 const SHOT = params.get('shot');
-const SEED = parseInt(params.get('seed') || '1', 10) || 1;
-const rng = mulberry32(SHOT ? SEED : (Date.now() % 2147483647));
+const SEED = params.get('seed');
 
-// ---- renderer / scene ----
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-$('game').appendChild(renderer.domElement);
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x14161a);
-scene.fog = new THREE.Fog(0x14161a, 45, 110);
-const camera = new THREE.PerspectiveCamera(90, innerWidth / innerHeight, 0.05, 220);
-camera.rotation.order = 'YXZ';
-scene.add(camera);
-
-scene.add(new THREE.HemisphereLight(0xbfd0e0, 0x2a241c, 1.15));
-const sun = new THREE.DirectionalLight(0xffe0b0, 1.6);
-sun.position.set(20, 38, -14);
-scene.add(sun);
-const fill = new THREE.DirectionalLight(0x7fb4ff, 0.35);
-fill.position.set(-18, 24, 20);
-scene.add(fill);
-
-const colliders = buildMap(scene);
-const graph = buildGraph(colliders);
-
-// ---- agents ----
-const player = new Player(camera);
-const bots = makeBots(scene);
-const agents = [player, ...bots];
-for (const a of agents) a.team = a === player ? 'strike' : a.team;
-
-// ---- match state (one place) ----
-const G = {
-  phase: 'menu', // menu | buy | live | roundEnd | matchEnd
-  round: 1,
-  scoreS: 0,
-  scoreA: 0,
-  roundTime: 0,
-  endTimer: 0,
-  endReason: '',
-  now: 0,
-  sitePick: 'A',
-  winner: null,
-};
-const bomb = {
-  state: 'none', // carried | dropped | planted | none
-  carrier: null,
-  site: 'A',
-  pos: new THREE.Vector3(0, 0, 0),
-  plantProgress: 0,
-  fuse: 0,
-  beepAt: 0,
-};
-const botMoney = new Map(bots.map((b) => [b, START_MONEY]));
-
-// Bomb mesh: a small charge with a blinking light, shown when dropped/planted.
-const bombMesh = new THREE.Group();
-{
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.22, 0.3),
-    new THREE.MeshStandardMaterial({ color: 0x1d1f24, roughness: 0.5, metalness: 0.5 }));
-  const light = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.06, 0.1),
-    new THREE.MeshStandardMaterial({ color: 0xff4444, emissive: 0xff2222, emissiveIntensity: 2 }));
-  light.position.set(0.12, 0.14, 0);
-  bombMesh.add(body, light);
-  bombMesh.userData.light = light;
-  bombMesh.visible = false;
-  scene.add(bombMesh);
+// Seeded RNG for deterministic renders (screenshots / smoke tests).
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
+if (SEED !== null) Math.random = mulberry32(parseInt(SEED, 10) || 1);
 
-// ---- tracers (pooled lines, no per-frame allocation) ----
-const tracers = [];
-for (let i = 0; i < 16; i++) {
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
-    color: 0xffd27a, transparent: true, opacity: 0,
-  }));
-  line.frustumCulled = false;
-  line.userData.life = 0;
-  scene.add(line);
-  tracers.push(line);
-}
-let tracerIdx = 0;
-function spawnTracer(from, to) {
-  const line = tracers[tracerIdx];
-  tracerIdx = (tracerIdx + 1) % tracers.length;
-  const attr = line.geometry.getAttribute('position');
-  attr.setXYZ(0, from.x, from.y, from.z);
-  attr.setXYZ(1, to.x, to.y, to.z);
-  attr.needsUpdate = true;
-  line.material.opacity = 0.9;
-  line.userData.life = 0.08;
-}
-
-// ---- grenades ----
-const grenades = [];
-const grenadeGeo = new THREE.SphereGeometry(0.09, 10, 8);
-const grenadeMat = new THREE.MeshStandardMaterial({ color: 0x22242a, roughness: 0.6, metalness: 0.5 });
-
-// ---- audio: tiny WebAudio synth, no assets ----
-let AC = null;
-function audio() {
-  if (!AC) {
-    try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; }
+// ---- Sound: tiny WebAudio synth, no audio files ----
+class Sfx {
+  constructor() { this.ctx = null; }
+  ensure() {
+    if (!this.ctx) { try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch { /* no audio */ } }
+    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
   }
-  if (AC && AC.state === 'suspended') AC.resume().catch(() => {});
-  return AC;
-}
-function tone(freq, dur, type, vol, slideTo) {
-  const ac = audio();
-  if (!ac) return;
-  try {
-    const o = ac.createOscillator(), g = ac.createGain();
-    o.type = type || 'sine';
-    o.frequency.setValueAtTime(freq, ac.currentTime);
-    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), ac.currentTime + dur);
-    g.gain.setValueAtTime(vol, ac.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
-    o.connect(g).connect(ac.destination);
-    o.start();
-    o.stop(ac.currentTime + dur + 0.02);
-  } catch (e) { /* audio is garnish */ }
-}
-function noise(dur, vol, cutoff) {
-  const ac = audio();
-  if (!ac) return;
-  try {
-    const len = Math.max(1, Math.floor(ac.sampleRate * dur));
-    const buf = ac.createBuffer(1, len, ac.sampleRate);
+  blip(freq, dur, type = 'sine', vol = 0.15, slide = 0) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(this.ctx.destination);
+    o.start(t); o.stop(t + dur);
+  }
+  noise(dur, vol = 0.25, low = 400) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const len = Math.max(1, (dur * this.ctx.sampleRate) | 0);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
     const d = buf.getChannelData(0);
     for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
-    const src = ac.createBufferSource();
-    src.buffer = buf;
-    const f = ac.createBiquadFilter();
-    f.type = 'lowpass'; f.frequency.value = cutoff || 3000;
-    const g = ac.createGain();
-    g.gain.value = vol;
-    src.connect(f).connect(g).connect(ac.destination);
-    src.start();
-  } catch (e) { /* ignore */ }
-}
-const sfx = {
-  shot(w, dist) {
-    const v = dist == null ? 0.5 : Math.max(0.06, 0.5 / (1 + dist * 0.09));
-    noise(0.09, v, w === 'LONGSHOT' ? 1800 : 3200);
-    tone(w === 'LONGSHOT' ? 130 : 190, 0.08, 'square', v * 0.5, 55);
-  },
-  dry() { tone(1400, 0.03, 'square', 0.12); },
-  reload() { tone(900, 0.04, 'square', 0.12); setTimeout(() => tone(620, 0.04, 'square', 0.12), 160); },
-  hit() { tone(1250, 0.05, 'sine', 0.22); },
-  kill() { tone(880, 0.07, 'sine', 0.22); setTimeout(() => tone(1320, 0.09, 'sine', 0.22), 80); },
-  hurt() { tone(220, 0.12, 'sawtooth', 0.18, 110); },
-  beep() { tone(1050, 0.06, 'sine', 0.2); },
-  plant() { tone(700, 0.1, 'sine', 0.2); setTimeout(() => tone(1050, 0.12, 'sine', 0.2), 120); },
-  explosion() { noise(0.9, 0.9, 700); tone(55, 0.7, 'sine', 0.7, 28); },
-  win() { [523, 659, 784].forEach((f, i) => setTimeout(() => tone(f, 0.16, 'sine', 0.2), i * 110)); },
-  lose() { [392, 311].forEach((f, i) => setTimeout(() => tone(f, 0.2, 'sine', 0.18), i * 140)); },
-  buy() { tone(990, 0.06, 'sine', 0.16); },
-};
-
-// ---- HUD ----
-const hud = {
-  score: $('hud-score'), clock: $('hud-clock'), phase: $('hud-phase'),
-  feed: $('killfeed'), hp: $('hp-num'), hpBar: $('hp-bar'), armor: $('armor'),
-  money: $('money'), wname: $('weapon-name'), mag: $('ammo-mag'), res: $('ammo-res'),
-  nades: $('grenades'), cross: $('crosshair'), hit: $('hitmarker'),
-  banner: $('banner'), channel: $('channel'), channelFill: $('channel-fill'),
-  channelLabel: $('channel-label'), charge: $('charge-chip'), hint: $('lock-hint'),
-  flash: $('flash'),
-};
-let lastHud = {};
-function setText(el, key, val) {
-  if (lastHud[key] !== val) { lastHud[key] = val; el.textContent = val; }
-}
-function banner(text, sub, ms) {
-  hud.banner.innerHTML = text + (sub ? `<span>${sub}</span>` : '');
-  hud.banner.classList.add('show');
-  clearTimeout(banner._t);
-  banner._t = setTimeout(() => hud.banner.classList.remove('show'), ms || 2600);
-}
-function killfeed(killer, victim, weapon, head) {
-  const row = document.createElement('div');
-  row.className = 'feed-row';
-  row.innerHTML = `<b class="${killer.team}">${killer.name}</b> <i>${weapon}${head ? ' ◉' : ''}</i> <b class="${victim.team}">${victim.name}</b>`;
-  hud.feed.prepend(row);
-  while (hud.feed.children.length > 5) hud.feed.lastChild.remove();
-  setTimeout(() => row.classList.add('fade'), 4200);
-  setTimeout(() => row.remove(), 5200);
-}
-function hitmarker(kill) {
-  hud.hit.classList.add(kill ? 'kill' : 'on');
-  clearTimeout(hitmarker._t);
-  hitmarker._t = setTimeout(() => hud.hit.classList.remove('on', 'kill'), 130);
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = low;
+    const g = this.ctx.createGain(); g.gain.value = vol;
+    src.connect(f).connect(g).connect(this.ctx.destination);
+    src.start(t);
+  }
+  shot(key) { this.noise(0.09, 0.3, key === 'LONGSHOT' ? 900 : 2400); this.blip(180, 0.06, 'square', 0.08, -120); }
+  enemyShot() { this.noise(0.07, 0.12, 1800); }
+  hit() { this.blip(1200, 0.05, 'sine', 0.12); }
+  kill() { this.blip(880, 0.07, 'sine', 0.14); this.blip(1320, 0.09, 'sine', 0.12); }
+  reload() { this.blip(500, 0.04, 'square', 0.07); }
+  plant() { this.blip(700, 0.1, 'sine', 0.15); }
+  beep() { this.blip(1000, 0.08, 'sine', 0.12); }
+  boom() { this.noise(0.7, 0.5, 220); this.blip(60, 0.6, 'sine', 0.3, -30); }
+  win() { [523, 659, 784].forEach((f, i) => setTimeout(() => this.blip(f, 0.18, 'sine', 0.15), i * 120)); }
+  lose() { [392, 330, 262].forEach((f, i) => setTimeout(() => this.blip(f, 0.2, 'sine', 0.12), i * 140)); }
 }
 
-// ---- input ----
-const input = {
-  forward: false, back: false, left: false, right: false,
-  jump: false, crouch: false, walk: false, interact: false,
-  lookX: 0, lookY: 0, fireHeld: false,
-};
-const KEYMAP = {
-  KeyW: 'forward', KeyS: 'back', KeyA: 'left', KeyD: 'right',
-  ShiftLeft: 'walk', ShiftRight: 'walk', ControlLeft: 'crouch', KeyC: 'crouch',
-  Space: 'jump', KeyE: 'interact',
-};
-addEventListener('keydown', (e) => {
-  if (e.code === 'Space') e.preventDefault();
-  const k = KEYMAP[e.code];
-  if (k) input[k] = true;
-  if (e.code === 'KeyR') tryReload();
-  if (e.code === 'KeyB') toggleBuy();
-  if (e.code === 'KeyG') throwFlash();
-  // Number keys buy while the buy menu is open, switch weapons otherwise.
-  if ($('buy-menu').classList.contains('open')) {
-    if (e.code === 'Digit1') buy('VK9');
-    if (e.code === 'Digit2') buy('AR7');
-    if (e.code === 'Digit3') buy('LONGSHOT');
-    if (e.code === 'Digit4') buy('KEVLAR');
-    if (e.code === 'Digit5') buy('FLASH');
-    return;
-  }
-  if (e.code === 'Digit1') switchWeapon(0);
-  if (e.code === 'Digit2') switchWeapon(1);
-  if (e.code === 'Enter' && G.phase === 'menu') deploy();
-});
-addEventListener('keyup', (e) => {
-  const k = KEYMAP[e.code];
-  if (k) input[k] = false;
-});
-addEventListener('mousemove', (e) => {
-  if (document.pointerLockElement) {
-    input.lookX += e.movementX;
-    input.lookY += e.movementY;
-  }
-});
-addEventListener('mousedown', (e) => {
-  if (e.button === 0) {
-    if (G.phase === 'live' || G.phase === 'buy') {
-      if (!document.pointerLockElement && !SHOT) {
-        lockPointer(); // first click captures the mouse, it does not fire
-      } else {
-        input.fireHeld = true;
-        tryFireOnce();
+// ---- Shared hitscan resolver: walls first, then bodies ----
+// A body is a vertical capsule (r 0.35, y 0.45..1.5) plus a head sphere
+// (centre y 1.58, r 0.24). Returns { target, part, dist, point } or null.
+function rayVsBody(origin, dir, targetPos) {
+  const ox = origin.x - targetPos.x, oz = origin.z - targetPos.z;
+  const dx = dir.x, dz = dir.z;
+  const a = dx * dx + dz * dz;
+  let best = null;
+  if (a > 1e-9) {
+    const b = 2 * (ox * dx + oz * dz), c = ox * ox + oz * oz - 0.35 * 0.35;
+    const disc = b * b - 4 * a * c;
+    if (disc >= 0) {
+      const t = (-b - Math.sqrt(disc)) / (2 * a);
+      if (t > 0.001) {
+        const y = origin.y + dir.y * t;
+        if (y >= 0.45 && y <= 1.5) best = { dist: t, part: 'body' };
       }
     }
   }
-  if (e.button === 2) {
-    player.scoped = player.current === 'LONGSHOT' && (G.phase === 'live');
-  }
-});
-addEventListener('mouseup', (e) => {
-  if (e.button === 0) input.fireHeld = false;
-  if (e.button === 2) player.scoped = false;
-});
-addEventListener('contextmenu', (e) => e.preventDefault());
-document.addEventListener('pointerlockchange', () => {
-  hud.hint.classList.toggle('show', !document.pointerLockElement && G.phase === 'live');
-});
-function lockPointer() {
-  try {
-    const p = renderer.domElement.requestPointerLock();
-    // Newer Chrome returns a promise that rejects when the lock cannot be taken
-    // (headless, no user gesture): swallow it and let the click fire instead,
-    // so the game stays playable without pointer lock.
-    if (p && typeof p.catch === 'function') {
-      p.catch(() => { input.fireHeld = true; tryFireOnce(); });
-    }
-  } catch (e) { /* headless: look stays put */ }
-}
-addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-});
-
-// ---- the shared hitscan resolver: player and bots shoot through this one function ----
-const _o = new THREE.Vector3();
-const _hit = new THREE.Vector3();
-function rayAABB(ox, oy, oz, dx, dy, dz, box) {
-  let t0 = 0, t1 = Infinity;
-  const axes = [[ox, dx, box.x0, box.x1], [oy, dy, box.y0, box.y1], [oz, dz, box.z0, box.z1]];
-  for (const [o, d, lo, hi] of axes) {
-    if (Math.abs(d) < 1e-9) {
-      if (o < lo || o > hi) return -1;
-    } else {
-      let ta = (lo - o) / d, tb = (hi - o) / d;
-      if (ta > tb) { const t = ta; ta = tb; tb = t; }
-      if (ta > t0) t0 = ta;
-      if (tb < t1) t1 = tb;
-      if (t0 > t1) return -1;
+  // Head sphere.
+  const hx = targetPos.x - origin.x, hy = 1.58 - origin.y, hz = targetPos.z - origin.z;
+  const tca = hx * dir.x + hy * dir.y + hz * dir.z;
+  if (tca > 0) {
+    const d2 = hx * hx + hy * hy + hz * hz - tca * tca;
+    if (d2 < 0.24 * 0.24) {
+      const t = tca - Math.sqrt(0.24 * 0.24 - d2);
+      if (t > 0.001 && (!best || t < best.dist)) best = { dist: t, part: 'head' };
     }
   }
-  return t0;
-}
-function hitBoxes(a) {
-  const crouch = a === player && player.crouched;
-  const headTop = crouch ? 1.32 : 1.8;
-  const headBot = crouch ? 1.0 : 1.45;
-  return {
-    body: { x0: a.pos.x - 0.36, x1: a.pos.x + 0.36, y0: 0.05, y1: headBot, z0: a.pos.z - 0.36, z1: a.pos.z + 0.36 },
-    head: { x0: a.pos.x - 0.2, x1: a.pos.x + 0.2, y0: headBot, y1: headTop, z0: a.pos.z - 0.2, z1: a.pos.z + 0.2 },
-  };
+  return best;
 }
 
-function fireShot(shooter, origin, dir, weaponId) {
-  const w = WEAPONS[weaponId];
-  const range = w.range;
-  const wallT = rayHit(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, range, colliders);
-  let bestT = wallT === -1 ? range : wallT;
-  let victim = null, head = false;
-  for (const a of agents) {
-    if (a === shooter || !a.alive) continue;
-    const boxes = hitBoxes(a);
-    const tb = rayAABB(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, boxes.body);
-    const th = rayAABB(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, boxes.head);
-    let t = -1, isHead = false;
-    if (th !== -1 && (tb === -1 || th <= tb)) { t = th; isHead = true; }
-    else if (tb !== -1) { t = tb; }
-    if (t !== -1 && t < bestT) { bestT = t; victim = a; head = isHead; }
+const WIN_ROUNDS = 9, ROUND_TIME = 100, BUY_TIME = 12;
+const ECON = { start: 800, kill: 300, win: 3250, detonate: 3500, loss: 1400, cap: 16000 };
+
+export class Game {
+  constructor() {
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setSize(innerWidth, innerHeight);
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    this.renderer.shadowMap.enabled = true;
+    document.getElementById('app').appendChild(this.renderer.domElement);
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x14161c);
+    this.scene.fog = new THREE.Fog(0x14161c, 30, 95);
+    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.08, 220);
+    const hemi = new THREE.HemisphereLight(0xd8e2f2, 0x4a4238, 1.5);
+    const sun = new THREE.DirectionalLight(0xffe6b0, 2.4);
+    sun.position.set(18, 30, 10); sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    Object.assign(sun.shadow.camera, { left: -40, right: 40, top: 30, bottom: -30, far: 90 });
+    this.scene.add(hemi, sun);
+    buildScene(this.scene);
+    this.nodes = buildWaypoints();
+    this.player = new Player(this.scene, this.camera);
+    this.bots = [];
+    const botWeapons = ['VK9', 'AR7', 'VK9'];
+    for (let i = 0; i < 3; i++) this.bots.push(new Bot(this.scene, i, 'STRIKE', botWeapons[i]));
+    for (let i = 0; i < 4; i++) this.bots.push(new Bot(this.scene, i + 3, 'AEGIS', i % 2 ? 'AR7' : 'VK9'));
+    this.sfx = new Sfx();
+    this.time = 0;
+    this.phase = 'menu'; // menu | buy | live | roundEnd | matchEnd
+    this.phaseT = 0;
+    this.round = 0;
+    this.score = { STRIKE: 0, AEGIS: 0 };
+    this.siteTarget = 'A';
+    this.planterId = 0;
+    this.bomb = { carrier: null, planted: false, site: null, fuse: 0, dropped: null, plantT: 0, defuseT: 0 };
+    this.killfeed = [];
+    this.tracers = [];
+    this.grenades = [];
+    this.keys = { f: false, b: false, l: false, r: false, jump: false, crouch: false, walk: false };
+    this.firing = false;
+    this.buyOpen = false;
+    this.plantHeld = false;
+    this.bannerT = 0;
+    this.stats = new Map(); // name -> {k,d}
+    this.acc = 0;
+    this.bindInput();
+    this.bindUI();
+    addEventListener('resize', () => {
+      this.camera.aspect = innerWidth / innerHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(innerWidth, innerHeight);
+    });
   }
-  _hit.copy(origin).addScaledVector(dir, bestT);
-  spawnTracer(origin, _hit);
-  if (victim) {
-    const dist = bestT;
-    const falloff = dist > 40 ? 0.65 : dist > 25 ? 0.8 : 1;
-    const dmg = w.damage * falloff * (head ? w.headMult : 1);
-    const dealt = victim.takeDamage(dmg, head);
-    if (shooter === player) {
-      hitmarker(false);
-      sfx.hit();
+
+  // ---- Match flow ----
+  startMatch() {
+    this.score = { STRIKE: 0, AEGIS: 0 };
+    this.round = 0;
+    this.stats = new Map();
+    for (const b of this.bots) { b.kills = 0; b.deaths = 0; }
+    this.player.kills = 0; this.player.deaths = 0;
+    this.player.money = ECON.start;
+    this.nextRound();
+  }
+
+  nextRound() {
+    this.round++;
+    this.phase = 'buy'; this.phaseT = BUY_TIME;
+    this.siteTarget = Math.random() < 0.5 ? 'A' : 'B';
+    this.bomb = { carrier: null, planted: false, site: null, fuse: 0, dropped: null, plantT: 0, defuseT: 0 };
+    // Spawn: player + STRIKE bots west, AEGIS east.
+    this.player.spawn(SPAWN_STRIKE[0], -Math.PI / 2);
+    this.player.hp = 100; this.player.armor = false;
+    for (const b of this.bots) {
+      if (b.team === 'STRIKE') b.spawn(SPAWN_STRIKE[1 + (b.id % 3)], -Math.PI / 2);
+      else b.spawn(SPAWN_AEGIS[b.id - 3], Math.PI / 2);
+      b.armor = Math.random() < 0.3;
+      if (Math.random() < 0.5) { b.weaponKey = 'AR7'; b.weapon = WEAPONS.AR7; }
     }
-    if (victim === player) sfx.hurt();
-    if (!victim.alive) {
-      shooter.kills = (shooter.kills || 0) + 1;
-      killfeed(
-        { name: shooter === player ? 'YOU' : shooter.name, team: shooter.team },
-        { name: victim === player ? 'YOU' : victim.name, team: victim.team },
-        w.name, head,
-      );
-      if (shooter === player) { player.money = Math.min(MAX_MONEY, player.money + KILL_REWARD); hitmarker(true); sfx.kill(); }
-      if (shooter !== player) botMoney.set(shooter, Math.min(MAX_MONEY, (botMoney.get(shooter) || 0) + KILL_REWARD));
-      if (victim === player) onPlayerDeath();
-      else victim.die();
-      if (bomb.carrier === victim) dropCharge(victim.pos);
-      checkRoundEnd();
+    // Bomb carrier: a random living STRIKE bot (never the player, so the
+    // objective is visible in the killfeed and the player can escort).
+    const carriers = this.bots.filter((b) => b.team === 'STRIKE');
+    this.planterId = carriers[(Math.random() * carriers.length) | 0].id;
+    this.bomb.carrier = this.planterId;
+    this.setBanner(`ROUND ${this.round} — ${this.siteTarget === 'A' ? 'SITE A (north)' : 'SITE B (south)'}`, 'Buy up. B opens the shop.');
+    this.openBuy(true);
+    this.updateHUD();
+  }
+
+  startLive() {
+    this.phase = 'live'; this.phaseT = ROUND_TIME;
+    this.openBuy(false);
+    this.setBanner('GO — take the site', '');
+    for (const b of this.bots) b.decide(this.botCtx());
+  }
+
+  endRound(winner, reason) {
+    if (this.phase === 'roundEnd' || this.phase === 'matchEnd') return;
+    this.score[winner]++;
+    const won = winner === 'STRIKE';
+    const reward = reason === 'detonation' ? ECON.detonate : ECON.win;
+    this.player.money = clamp(this.player.money + (won ? reward : ECON.loss), 0, ECON.cap);
+    this.setBanner(won ? 'STRIKE TAKES THE ROUND' : 'AEGIS HOLDS THE ROUND', reason);
+    if (won) this.sfx.win(); else this.sfx.lose();
+    if (this.score[winner] >= WIN_ROUNDS) { this.endMatch(winner); return; }
+    this.phase = 'roundEnd'; this.phaseT = 4;
+  }
+
+  endMatch(winner) {
+    this.phase = 'matchEnd'; this.phaseT = 0;
+    document.exitPointerLock?.();
+    $('endTitle').textContent = winner === 'STRIKE' ? 'STRIKE WINS THE MATCH' : 'AEGIS WINS THE MATCH';
+    $('endTitle').style.color = winner === 'STRIKE' ? '#7ee787' : '#ff7b72';
+    $('endScore').textContent = `STRIKE ${this.score.STRIKE} — ${this.score.AEGIS} AEGIS`;
+    const rows = [['YOU', this.player.kills, this.player.deaths]];
+    for (const b of this.bots) rows.push([b.name + (b.team === 'STRIKE' ? ' (S)' : ' (A)'), b.kills, b.deaths]);
+    rows.sort((a, b) => b[1] - a[1]);
+    $('kdTable').innerHTML = rows.map(([n, k, d]) =>
+      `<tr><td>${n}</td><td>${k}</td><td>${d}</td><td>${(k / Math.max(1, d)).toFixed(2)}</td></tr>`).join('');
+    $('endScreen').classList.remove('hidden');
+    if (winner === 'STRIKE') this.sfx.win(); else this.sfx.lose();
+  }
+
+  botCtx() {
+    return { nodes: this.nodes, bomb: this.bomb, planterId: this.planterId, siteTarget: this.siteTarget, time: this.time };
+  }
+
+  // ---- Combat: the one resolver for player and bots ----
+  allTargets() {
+    const out = [];
+    if (this.player.alive) out.push({ pos: this.player.pos, eye: this.player.eye, alive: true, isPlayer: true, ref: this.player, team: 'STRIKE' });
+    for (const b of this.bots) if (b.alive) out.push({ pos: b.pos, eye: b.eye, alive: true, isPlayer: false, ref: b, team: b.team });
+    return out;
+  }
+
+  resolveShot(shot) {
+    const wall = raycast(shot.origin, shot.dir, shot.weapon.range);
+    const wallDist = wall ? wall.dist : Infinity;
+    let best = null;
+    const shooterTeam = shot.shooter === 'player' ? 'STRIKE' : shot.shooter.team;
+    for (const t of this.allTargets()) {
+      if (t.team === shooterTeam) continue;
+      if (shot.shooter !== 'player' && t.ref === shot.shooter) continue;
+      const hit = rayVsBody(shot.origin, shot.dir, t.pos);
+      if (hit && hit.dist < wallDist && (!best || hit.dist < best.dist)) best = { ...hit, target: t };
     }
-    return { hit: true, victim, head, dealt };
-  }
-  return { hit: false };
-}
-
-function tryFireOnce() {
-  if (G.phase !== 'live' || !player.alive) return;
-  if (player.tryFire(G.now)) {
-    const origin = player.eyePos();
-    const dir = player.shotDirection();
-    fireShot(player, origin, dir, player.current);
-    sfx.shot(player.current, null);
-  } else if (player.ammo().mag === 0 && player.cooldown <= 0) {
-    sfx.dry();
-    tryReload();
-  }
-}
-function tryReload() {
-  if (G.phase === 'live' || G.phase === 'buy') {
-    if (player.startReload()) sfx.reload();
-  }
-}
-function switchWeapon(slot) {
-  if (slot === 0 && player.slots[0]) {
-    player.current = player.slots[0];
-    player.scoped = false;
-  } else if (slot === 1) {
-    player.current = 'P9';
-    player.scoped = false;
-  }
-}
-
-// ---- buy menu ----
-function toggleBuy() {
-  if (G.phase !== 'buy' || !player.alive) return;
-  const m = $('buy-menu');
-  m.classList.toggle('open');
-  refreshBuy();
-}
-function refreshBuy() {
-  $('buy-money').textContent = `$${player.money}`;
-  for (const btn of document.querySelectorAll('[data-buy]')) {
-    const id = btn.dataset.buy;
-    const price = id === 'KEVLAR' ? KEVLAR_PRICE : id === 'FLASH' ? FLASH_PRICE : WEAPONS[id].price;
-    btn.classList.toggle('cant', player.money < price || (id === 'KEVLAR' && player.armor));
-  }
-}
-function buy(item) {
-  if (G.phase !== 'buy' || !player.alive) return;
-  let price = 0;
-  if (item === 'KEVLAR') {
-    if (player.armor || player.money < KEVLAR_PRICE) return;
-    price = KEVLAR_PRICE;
-    player.money -= price;
-    player.armor = true;
-  } else if (item === 'FLASH') {
-    if (player.money < FLASH_PRICE) return;
-    price = FLASH_PRICE;
-    player.money -= price;
-    player.grenades += 1;
-  } else {
-    const w = WEAPONS[item];
-    if (player.money < w.price) return;
-    price = w.price;
-    player.money -= price;
-    if (player.owned[item]) {
-      player.owned[item].mag = w.mag;
-      player.owned[item].reserve = w.reserve;
-    } else {
-      player.owned[item] = { mag: w.mag, reserve: w.reserve };
-      player.slots[0] = item;
-      player.current = item;
+    const end = best
+      ? shot.origin.clone().addScaledVector(shot.dir, best.dist)
+      : (wall ? wall.point : shot.origin.clone().addScaledVector(shot.dir, shot.weapon.range));
+    this.addTracer(shot.origin, end, shot.shooter === 'player');
+    if (best) {
+      const dmg = shot.weapon.dmg * (best.part === 'head' ? shot.weapon.head : 1);
+      const wasAlive = best.target.ref.alive;
+      best.target.ref.takeDamage(dmg);
+      if (shot.shooter === 'player') { this.sfx.hit(); this.flashHitmarker(best.part === 'head'); }
+      if (wasAlive && !best.target.ref.alive) this.onKill(shot.shooter, best.target);
     }
-    player.scoped = false;
+    return best;
   }
-  sfx.buy();
-  refreshBuy();
-}
-for (const btn of document.querySelectorAll('[data-buy]')) {
-  btn.addEventListener('click', () => buy(btn.dataset.buy));
-}
-$('buy-close').addEventListener('click', () => $('buy-menu').classList.remove('open'));
 
-// ---- grenade ----
-function throwFlash() {
-  if (G.phase !== 'live' || !player.alive || player.grenades <= 0) return;
-  player.grenades -= 1;
-  const origin = player.eyePos();
-  const dir = new THREE.Vector3(-Math.sin(player.yaw), 0.16, -Math.cos(player.yaw)).normalize();
-  const mesh = new THREE.Mesh(grenadeGeo, grenadeMat);
-  mesh.position.copy(origin);
-  scene.add(mesh);
-  grenades.push({
-    pos: origin.clone(), vel: dir.multiplyScalar(15).add(new THREE.Vector3(0, 3.5, 0)),
-    timer: 1.4, mesh,
-  });
-  tone(600, 0.05, 'square', 0.1);
-}
-function explodeFlash(g) {
-  scene.remove(g.mesh);
-  noise(0.25, 0.7, 5000);
-  tone(2400, 0.3, 'sine', 0.25, 800);
-  const p = g.pos;
-  for (const b of bots) {
-    if (!b.alive) continue;
-    const dx = p.x - b.pos.x, dy = p.y - b.eyePos().y, dz = p.z - b.pos.z;
-    const d = Math.hypot(dx, dy, dz);
-    if (d > 18) continue;
-    if (!hasLOS(p.x, p.y, p.z, b.pos.x, b.eyePos().y, b.pos.z, colliders)) continue;
-    const fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
-    if ((dx * fx + dz * fz) / (d || 1) < -0.2) continue; // looking away
-    b.blindUntil = G.now + 2.5;
+  onKill(shooter, victim) {
+    const sName = shooter === 'player' ? 'YOU' : shooter.name;
+    const vName = victim.isPlayer ? 'YOU' : victim.ref.name;
+    this.feed(`${sName} ▸ ${vName}`);
+    if (shooter === 'player') { this.player.money = clamp(this.player.money + ECON.kill, 0, ECON.cap); this.player.kills++; this.sfx.kill(); }
+    else shooter.kills++;
+    // Deaths are counted once, inside takeDamage.
+    // Bomb drops when its carrier dies.
+    if (this.bomb.carrier !== null && !victim.isPlayer && victim.ref.id === this.bomb.carrier && !this.bomb.planted) {
+      this.bomb.carrier = null;
+      this.bomb.dropped = { x: victim.pos.x, z: victim.pos.z };
+      this.feed('CHARGE DROPPED — pick it up');
+    }
+    this.checkElimination();
   }
-  if (player.alive) {
-    const dx = p.x - player.pos.x, dy = p.y - player.eyePos().y, dz = p.z - player.pos.z;
-    const d = Math.hypot(dx, dy, dz);
-    if (d < 30 && hasLOS(p.x, p.y, p.z, player.pos.x, player.eyePos().y, player.pos.z, colliders)) {
-      const fx = -Math.sin(player.yaw), fz = -Math.cos(player.yaw);
-      if ((dx * fx + dz * fz) / (d || 1) > 0.05) {
-        hud.flash.style.opacity = '0.95';
-        setTimeout(() => { hud.flash.style.opacity = '0'; }, 350);
+
+  checkElimination() {
+    if (this.phase !== 'live') return;
+    const strikeAlive = this.player.alive || this.bots.some((b) => b.team === 'STRIKE' && b.alive);
+    const aegisAlive = this.bots.some((b) => b.team === 'AEGIS' && b.alive);
+    if (this.bomb.planted) { if (!aegisAlive) this.endRound('STRIKE', 'elimination'); return; }
+    if (!strikeAlive) this.endRound('AEGIS', 'elimination');
+    else if (!aegisAlive) this.endRound('STRIKE', 'elimination');
+  }
+
+  // ---- Grenades ----
+  throwGrenade() {
+    if (this.player.grenades <= 0 || !this.player.alive) return;
+    this.player.grenades--;
+    const dir = new THREE.Vector3();
+    this.camera.getWorldDirection(dir);
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.09, 10, 8),
+      new THREE.MeshStandardMaterial({ color: 0x3a5f2a, roughness: 0.5 }));
+    mesh.position.copy(this.player.eye).addScaledVector(dir, 0.5);
+    this.scene.add(mesh);
+    this.grenades.push({ mesh, vel: dir.multiplyScalar(13).add(new THREE.Vector3(0, 3, 0)), t: 0 });
+    this.sfx.blip(300, 0.08, 'square', 0.1);
+    this.updateHUD();
+  }
+
+  updateGrenades(dt) {
+    for (let i = this.grenades.length - 1; i >= 0; i--) {
+      const g = this.grenades[i];
+      g.t += dt;
+      g.vel.y -= 14 * dt;
+      g.mesh.position.addScaledVector(g.vel, dt);
+      if (g.mesh.position.y < 0.09) { g.mesh.position.y = 0.09; g.vel.y *= -0.4; g.vel.x *= 0.7; g.vel.z *= 0.7; }
+      if (g.t >= 1.2) {
+        const p = g.mesh.position.clone();
+        this.scene.remove(g.mesh);
+        this.grenades.splice(i, 1);
+        this.sfx.boom();
+        const flash = new THREE.PointLight(0xffa040, 60, 18, 1.6);
+        flash.position.copy(p); this.scene.add(flash);
+        setTimeout(() => this.scene.remove(flash), 180);
+        for (const t of this.allTargets()) {
+          const d = t.pos.distanceTo(p);
+          if (d < 7) {
+            const dmg = (1 - d / 7) * 95;
+            const eye = t.eye.clone(); eye.y = 0.9;
+            if (hasLOS(p, eye)) t.ref.takeDamage(dmg);
+          }
+        }
+        this.checkElimination();
       }
     }
   }
-}
 
-// ---- charge ----
-function dropCharge(pos) {
-  bomb.state = 'dropped';
-  bomb.carrier = null;
-  bomb.pos.set(pos.x, 0.12, pos.z);
-  bombMesh.visible = true;
-  bombMesh.position.copy(bomb.pos);
-}
-function plantCharge(byBot) {
-  bomb.state = 'planted';
-  bomb.fuse = 40;
-  bomb.pos.set(byBot ? byBot.pos.x : player.pos.x, 0.12, byBot ? byBot.pos.z : player.pos.z);
-  bomb.site = inSite(SITES.A, bomb.pos.x, bomb.pos.z) ? 'A' : 'B';
-  bombMesh.visible = true;
-  bombMesh.position.copy(bomb.pos);
-  banner('CHARGE PLANTED', `Site ${bomb.site} — 40 seconds on the fuse`, 3000);
-  sfx.plant();
-  for (const b of bots) { b.path = null; b.repathAt = 0; }
-}
-function detonate() {
-  sfx.explosion();
-  bombMesh.visible = false;
-  bomb.state = 'none';
-  endRound('strike', 'Detonation — site destroyed');
-}
+  addTracer(from, to, friendly) {
+    const geo = new THREE.BufferGeometry().setFromPoints([from, to]);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+      color: friendly ? 0xffe08a : 0xff8a6a, transparent: true, opacity: 0.9,
+    }));
+    this.scene.add(line);
+    this.tracers.push({ line, t: 0.07 });
+  }
 
-// ---- round / match flow ----
-function botBuy(b) {
-  let money = botMoney.get(b);
-  let pick = 'P9';
-  if (money >= 4300 && rng() < 0.22) pick = 'LONGSHOT';
-  else if (money >= 2700) pick = 'AR7';
-  else if (money >= 1400) pick = 'VK9';
-  const price = WEAPONS[pick].price;
-  money -= price;
-  let armor = false;
-  if (money >= KEVLAR_PRICE + 400 && rng() < 0.55) { armor = true; money -= KEVLAR_PRICE; }
-  botMoney.set(b, money);
-  b.money = money;
-  return { weaponId: pick, armor };
-}
-
-function startMatch() {
-  G.scoreS = 0; G.scoreA = 0; G.round = 1; G.winner = null;
-  player.resetMatch();
-  for (const b of bots) { botMoney.set(b, START_MONEY); b.kills = 0; b.deaths = 0; }
-  $('end-screen').classList.add('hidden');
-  $('menu').classList.add('hidden');
-  startRound();
-}
-
-function startRound() {
-  G.sitePick = rng() < 0.5 ? 'A' : 'B';
-  const otherSite = G.sitePick === 'A' ? 'B' : 'A';
-  // STRIKE: player + 3 bots west; AEGIS: 4 bots east.
-  player.resetRound(SPAWNS.strike[0], -Math.PI / 2);
-  player.owned.P9 = { mag: WEAPONS.P9.mag, reserve: WEAPONS.P9.reserve };
-  bots.forEach((b, i) => {
-    const spawn = b.team === 'strike' ? SPAWNS.strike[i + 1] : SPAWNS.aegis[i - 3];
-    const buyInfo = botBuy(b);
-    b.resetRound(spawn[0], spawn[1], b.team === 'strike' ? -Math.PI / 2 : Math.PI / 2,
-      buyInfo.weaponId, buyInfo.armor);
-    if (b.team === 'strike') {
-      b.siteKey = i === 2 ? otherSite : G.sitePick; // one flanker takes the other site
-    } else {
-      // AEGIS posts: two on A, one on B, one roaming mid.
-      const posts = {
-        a0: [19, -13], a1: [26, -18], a2: [19, 13], a3: [4, 0],
-      };
-      b.post = { x: posts[b.id][0], z: posts[b.id][1] };
-    }
-  });
-  bomb.state = 'carried';
-  bomb.carrier = player;
-  bomb.plantProgress = 0;
-  bomb.fuse = 0;
-  bombMesh.visible = false;
-  G.phase = 'buy';
-  G.roundTime = 12;
-  $('buy-menu').classList.remove('open');
-  banner(`ROUND ${G.round}`, 'Buy phase — B for the buy menu', 2200);
-}
-
-function awardMoney(winner) {
-  for (const a of agents) {
-    if (a === player) {
-      player.money = Math.min(MAX_MONEY, player.money + (a.team === winner ? (bomb.state === 'none' && G.endReason.startsWith('Detonation') ? DETONATION_WIN : ROUND_WIN) : ROUND_LOSS));
+  updateTracers(dt) {
+    for (let i = this.tracers.length - 1; i >= 0; i--) {
+      const tr = this.tracers[i];
+      tr.t -= dt;
+      if (tr.t <= 0) { this.scene.remove(tr.line); tr.line.geometry.dispose(); this.tracers.splice(i, 1); }
     }
   }
-  for (const b of bots) {
-    const m = botMoney.get(b);
-    const gain = b.team === winner
-      ? (G.endReason.startsWith('Detonation') ? DETONATION_WIN : ROUND_WIN)
-      : ROUND_LOSS;
-    botMoney.set(b, Math.min(MAX_MONEY, m + gain));
-  }
-}
 
-function endRound(winner, reason) {
-  if (G.phase !== 'live' && G.phase !== 'buy') return;
-  G.phase = 'roundEnd';
-  G.endReason = reason;
-  if (winner === 'strike') G.scoreS += 1; else G.scoreA += 1;
-  awardMoney(winner);
-  G.endTimer = 4.5;
-  $('buy-menu').classList.remove('open');
-  const won = winner === 'strike';
-  banner(won ? 'STRIKE TAKES THE ROUND' : 'AEGIS TAKES THE ROUND', reason, 3200);
-  if (won) sfx.win(); else sfx.lose();
-}
-
-function endMatch() {
-  G.phase = 'matchEnd';
-  G.winner = G.scoreS > G.scoreA ? 'strike' : 'aegis';
-  if (document.pointerLockElement) document.exitPointerLock();
-  $('end-title').textContent = G.winner === 'strike' ? 'STRIKE WINS THE MATCH' : 'AEGIS WINS THE MATCH';
-  $('end-score').textContent = `${G.scoreS} — ${G.scoreA}`;
-  const rows = [...agents]
-    .sort((a, b) => (b.kills - b.deaths) - (a.kills - a.deaths))
-    .map((a) => `<tr><td class="${a.team}">${a === player ? 'YOU' : a.name}</td><td>${a.team.toUpperCase()}</td><td>${a.kills}</td><td>${a.deaths}</td></tr>`)
-    .join('');
-  $('kd-body').innerHTML = rows;
-  $('end-screen').classList.remove('hidden');
-  if (G.winner === 'strike') sfx.win(); else sfx.lose();
-}
-
-function checkRoundEnd() {
-  if (G.phase !== 'live') return;
-  const sAlive = agents.filter((a) => a.team === 'strike' && a.alive).length;
-  const aAlive = agents.filter((a) => a.team === 'aegis' && a.alive).length;
-  if (bomb.state === 'planted') {
-    if (aAlive === 0) return; // fuse still decides it
-    return;
-  }
-  if (sAlive === 0) endRound('aegis', 'STRIKE eliminated');
-  else if (aAlive === 0) endRound('strike', 'AEGIS eliminated');
-}
-
-function onPlayerDeath() {
-  player.scoped = false;
-  if (document.pointerLockElement) document.exitPointerLock();
-  banner('YOU ARE DOWN', 'Spectating your team', 2400);
-}
-
-// ---- bot context: everything a bot needs from the match ----
-function botContext() {
-  return {
-    now: G.now,
-    rng,
-    graph,
-    colliders,
-    agents,
-    bomb,
-    shoot: (bot, origin, dir, weaponId) => {
-      fireShot(bot, origin, dir, weaponId);
-      const d = origin.distanceTo(player.eyePos());
-      sfx.shot(weaponId, d);
-    },
-    carrierAgent: () => (bomb.carrier && bomb.carrier.alive ? bomb.carrier : null),
-    onPlant: (bot) => { bomb.carrier = bot; plantCharge(bot); },
-    onDefuse: () => endRound('aegis', 'Charge defused'),
-    onPickup: (bot) => {
-      bomb.state = 'carried';
-      bomb.carrier = bot;
-      bombMesh.visible = false;
-    },
-  };
-}
-
-// ---- simulation step (fixed 1/60) ----
-function sim(dt) {
-  G.now += dt;
-  if (G.phase === 'menu') {
-    const t = G.now;
-    camera.position.set(-28, 2.4, Math.sin(t * 0.12) * 2);
-    camera.rotation.set(0, -Math.PI / 2 + Math.sin(t * 0.1) * 0.18, 0);
-    return;
-  }
-  if (G.phase === 'buy') {
-    G.roundTime -= dt;
-    player.update(dt, input, colliders);
-    if (G.roundTime <= 0) {
-      G.phase = 'live';
-      G.roundTime = 100;
-      banner('GO', 'Plant the charge or eliminate AEGIS', 1800);
-      tone(660, 0.1, 'sine', 0.2);
-    }
-  } else if (G.phase === 'live') {
-    G.roundTime -= dt;
-    // Player plant channel: hold E, still, inside a site, carrying the charge.
-    if (bomb.state === 'carried' && bomb.carrier === player && player.alive) {
-      const site = inSite(SITES.A, player.pos.x, player.pos.z) ? SITES.A
-        : inSite(SITES.B, player.pos.x, player.pos.z) ? SITES.B : null;
-      if (site && input.interact && player.speed2d < 0.6) {
-        bomb.plantProgress += dt;
-        if (bomb.plantProgress >= 3) plantCharge(null);
-      } else {
-        bomb.plantProgress = Math.max(0, bomb.plantProgress - dt * 2);
+  // ---- Bomb: plant / fuse / defuse / pickup ----
+  updateBomb(dt) {
+    const b = this.bomb;
+    if (b.planted) {
+      b.fuse -= dt;
+      if (b.fuse <= 0) { this.sfx.boom(); this.endRound('STRIKE', 'detonation'); return; }
+      // AEGIS bots that reach the site defuse.
+      for (const bot of this.bots) {
+        if (bot.team !== 'AEGIS' || !bot.alive) continue;
+        if (Math.hypot(bot.pos.x - b.site.x, bot.pos.z - b.site.z) < 2.2) {
+          bot.defusing += dt;
+          if (bot.defusing >= 5) { bot.defusing = 0; b.planted = false; this.feed('CHARGE DEFUSED'); this.endRound('AEGIS', 'defuse'); return; }
+        } else bot.defusing = 0;
       }
-    }
-    // Fuse.
-    if (bomb.state === 'planted') {
-      bomb.fuse -= dt;
-      const interval = bomb.fuse > 20 ? 1.0 : bomb.fuse > 10 ? 0.5 : 0.25;
-      if (G.now >= bomb.beepAt) {
-        sfx.beep();
-        bomb.beepAt = G.now + interval;
-        bombMesh.userData.light.material.emissiveIntensity =
-          bombMesh.userData.light.material.emissiveIntensity > 1 ? 0.2 : 2;
-      }
-      if (bomb.fuse <= 0) { detonate(); return; }
-    }
-    // Timeout with no plant: defenders win.
-    if (G.roundTime <= 0 && bomb.state !== 'planted') {
-      endRound('aegis', 'Time — the charge never went down');
       return;
     }
-    player.update(dt, input, colliders);
-    // Hold-to-fire for automatics.
-    if (input.fireHeld && player.weapon().auto && player.cooldown <= 0) tryFireOnce();
-    // Bots.
-    const ctx = botContext();
-    for (const b of bots) b.update(dt, ctx);
-    // Spectate when dead: camera rides the first living teammate.
-    if (!player.alive) {
-      const mate = bots.find((b) => b.team === 'strike' && b.alive);
-      if (mate) {
-        const bx = mate.pos.x + Math.sin(mate.yaw) * 2.4;
-        const bz = mate.pos.z + Math.cos(mate.yaw) * 2.4;
-        camera.position.set(bx, 2.1, bz);
-        camera.rotation.set(0, mate.yaw, 0);
-        camera.rotateX(-0.12);
+    // Player plant: hold E inside a site while carrying the charge.
+    if (this.phase === 'live' && this.player.alive && this.plantHeld && b.carrier === 'player') {
+      const site = this.inSite(this.player.pos);
+      if (site) {
+        b.plantT += dt;
+        if (Math.floor(b.plantT * 4) !== Math.floor((b.plantT - dt) * 4)) this.sfx.beep();
+        if (b.plantT >= 3) {
+          b.planted = true; b.site = site; b.fuse = 40; b.plantT = 0;
+          this.feed('CHARGE PLANTED — 40s fuse'); this.sfx.plant();
+          for (const bot of this.bots) bot.decide(this.botCtx());
+        }
+      } else b.plantT = 0;
+    } else b.plantT = 0;
+    // Carrier bot plants when it reaches its site.
+    if (b.carrier !== null && b.carrier !== 'player') {
+      const bot = this.bots[b.carrier];
+      if (bot && bot.alive) {
+        const site = this.inSite(bot.pos);
+        if (site && bot.goal?.why === 'plant') {
+          bot.planting += dt;
+          if (bot.planting >= 3) {
+            b.planted = true; b.site = site; b.fuse = 40; b.planting = 0;
+            this.feed(`${bot.name} PLANTED THE CHARGE`); this.sfx.plant();
+            for (const o of this.bots) o.decide(this.botCtx());
+          }
+        } else bot.planting = 0;
       }
     }
-  } else if (G.phase === 'roundEnd') {
-    G.endTimer -= dt;
-    for (const b of bots) if (b.alive) b.syncMesh();
-    if (G.endTimer <= 0) {
-      if (G.scoreS >= 9 || G.scoreA >= 9) endMatch();
-      else { G.round += 1; startRound(); }
-    }
-  }
-  // Grenades fly in buy/live.
-  if (G.phase === 'live' || G.phase === 'buy') {
-    for (let i = grenades.length - 1; i >= 0; i--) {
-      const g = grenades[i];
-      g.timer -= dt;
-      g.vel.y -= 12 * dt;
-      const nx = g.pos.x + g.vel.x * dt;
-      const nz = g.pos.z + g.vel.z * dt;
-      // Wall bounce: axis-separated, like movement.
-      let px = g.pos.x, pz = g.pos.z;
-      if (!circleHits(nx, pz, 0.15, colliders)) px = nx; else g.vel.x *= -0.4;
-      if (!circleHits(px, nz, 0.15, colliders)) pz = nz; else g.vel.z *= -0.4;
-      g.pos.set(px, g.pos.y + g.vel.y * dt, pz);
-      if (g.pos.y < 0.1) { g.pos.y = 0.1; g.vel.y *= -0.35; g.vel.x *= 0.7; g.vel.z *= 0.7; }
-      g.mesh.position.copy(g.pos);
-      if (g.timer <= 0) {
-        explodeFlash(g);
-        grenades.splice(i, 1);
+    // Pickup of a dropped charge.
+    if (b.dropped && this.player.alive) {
+      if (Math.hypot(this.player.pos.x - b.dropped.x, this.player.pos.z - b.dropped.z) < 1.4) {
+        b.carrier = 'player'; b.dropped = null;
+        this.feed('YOU PICKED UP THE CHARGE'); this.sfx.beep();
       }
     }
   }
-  updateHud();
-}
 
-function circleHits(x, z, r, cols) {
-  for (const c of cols) {
-    if (x >= c.x0 - r && x <= c.x1 + r && z >= c.z0 - r && z <= c.z1 + r) return true;
+  inSite(p) {
+    if (Math.hypot(p.x - SITE_A.x, p.z - SITE_A.z) < SITE_R) return SITE_A;
+    if (Math.hypot(p.x - SITE_B.x, p.z - SITE_B.z) < SITE_R) return SITE_B;
+    return null;
   }
-  return false;
-}
 
-// ---- HUD refresh ----
-function updateHud() {
-  const mm = Math.max(0, Math.ceil(bomb.state === 'planted' ? bomb.fuse : G.roundTime));
-  const clock = `${Math.floor(mm / 60)}:${String(mm % 60).padStart(2, '0')}`;
-  setText(hud.score, 'score', `STRIKE ${G.scoreS} — ${G.scoreA} AEGIS · ROUND ${G.round}`);
-  setText(hud.clock, 'clock', bomb.state === 'planted' ? `FUSE ${clock}` : clock);
-  setText(hud.phase, 'phase',
-    G.phase === 'buy' ? 'BUY PHASE — press B' : G.phase === 'live' ? (bomb.state === 'planted' ? 'CHARGE LIVE' : 'LIVE') : G.phase.toUpperCase());
-  setText(hud.hp, 'hp', `${Math.ceil(player.hp)}`);
-  hud.hpBar.style.width = `${Math.max(0, player.hp)}%`;
-  hud.hpBar.classList.toggle('low', player.hp <= 30);
-  hud.armor.classList.toggle('on', player.armor);
-  setText(hud.money, 'money', `$${player.money}`);
-  const w = player.weapon();
-  setText(hud.wname, 'wname', w.name + (player.scoped ? ' · SCOPED' : ''));
-  const a = player.ammo();
-  setText(hud.mag, 'mag', `${a.mag}`);
-  setText(hud.res, 'res', `/ ${a.reserve}`);
-  setText(hud.nades, 'nades', `FLASH ×${player.grenades}`);
-  const gap = 5 + player.currentSpread() * 900;
-  hud.cross.style.setProperty('--gap', `${gap.toFixed(1)}px`);
-  hud.charge.classList.toggle('show',
-    bomb.state === 'carried' && bomb.carrier === player && G.phase === 'live');
-  hud.charge.textContent = 'CHARGE — hold E on a site to plant';
-  // Plant / defuse progress bar.
-  let prog = -1, label = '';
-  if (bomb.state === 'carried' && bomb.carrier === player && bomb.plantProgress > 0) {
-    prog = bomb.plantProgress / 3; label = 'PLANTING';
-  } else {
-    const defuser = bots.find((b) => b.team === 'aegis' && b.state === 'defuse' && b.defuseProgress > 0);
-    if (defuser) { prog = defuser.defuseProgress / 5; label = 'DEFUSE IN PROGRESS'; }
+  // ---- Fixed-step update ----
+  step(dt) {
+    this.time += dt;
+    if (this.phase === 'buy') {
+      this.phaseT -= dt;
+      if (this.phaseT <= 0) this.startLive();
+    } else if (this.phase === 'live') {
+      this.phaseT -= dt;
+      if (this.phaseT <= 0 && !this.bomb.planted) { this.endRound('AEGIS', 'time'); return; }
+      if (this.phaseT <= 0 && this.bomb.planted) { /* fuse handles it */ }
+    } else if (this.phase === 'roundEnd') {
+      this.phaseT -= dt;
+      if (this.phaseT <= 0) this.nextRound();
+    }
+    if (this.phase === 'live' || this.phase === 'buy') {
+      this.player.update(dt, this.keys, this.time);
+      if (this.firing && this.phase === 'live') {
+        const shot = this.player.fire(this.time);
+        if (shot) { this.resolveShot(shot); this.sfx.shot(shot.key); }
+        else if (this.player.ammo[this.player.weaponKey].mag === 0 && this.player.reloading <= 0) this.player.reload();
+      }
+      const ctx = this.botCtx();
+      const enemies = this.allTargets();
+      for (const bot of this.bots) {
+        if (this.phase === 'live' && Math.random() < 0.02) bot.decide(ctx);
+        const shot = bot.update(dt, ctx, enemies);
+        if (shot) { this.resolveShot(shot); if (Math.random() < 0.5) this.sfx.enemyShot(); }
+      }
+      this.updateBomb(dt);
+      this.updateGrenades(dt);
+    }
+    this.updateTracers(dt);
+    if (this.bannerT > 0) this.bannerT -= dt;
+    this.updateHUD();
   }
-  if (prog >= 0) {
-    hud.channel.classList.add('show');
-    hud.channelFill.style.width = `${Math.min(100, prog * 100)}%`;
-    hud.channelLabel.textContent = label;
-  } else {
-    hud.channel.classList.remove('show');
-  }
-}
 
-// ---- menu / deploy / play again ----
-function deploy() {
-  if (G.phase !== 'menu') return;
-  audio();
-  startMatch();
-  lockPointer();
-}
-$('deploy').addEventListener('click', deploy);
-$('play-again').addEventListener('click', () => {
-  startMatch();
-  lockPointer();
-});
-
-// ---- deterministic ?shot= render modes for the screenshots ----
-function applyShotMode() {
-  if (SHOT === 'start') {
-    placeAgentsForShot();
-    return; // menu stays up over the scene
+  frame() {
+    const now = performance.now() / 1000;
+    let dt = Math.min(0.1, now - (this.lastFrame ?? now));
+    this.lastFrame = now;
+    this.acc += dt;
+    const STEP = 1 / 60;
+    let n = 0;
+    while (this.acc >= STEP && n < 5) { this.step(STEP); this.acc -= STEP; n++; }
+    if (n === 5) this.acc = 0;
+    this.renderer.render(this.scene, this.camera);
   }
-  if (SHOT === 'play') {
-    $('menu').classList.add('hidden');
-    startMatch();
-    G.phase = 'live';
-    G.roundTime = 95;
-    player.pos.set(-18, 0, 0);
-    player.yaw = -Math.PI / 2;
-    const aegis = bots.filter((b) => b.team === 'aegis');
-    if (aegis[0]) { aegis[0].pos.set(6, 0, 1.5); aegis[0].yaw = Math.PI / 2; }
-    if (aegis[1]) { aegis[1].pos.set(10, 0, -4); aegis[1].yaw = Math.PI / 2; }
-    if (aegis[2]) { aegis[2].pos.set(2, 0, -6); aegis[2].yaw = Math.PI / 2; }
-    return;
-  }
-  if (SHOT === 'end') {
-    $('menu').classList.add('hidden');
-    G.scoreS = 9; G.scoreA = 7; G.round = 16;
-    player.kills = 14; player.deaths = 9;
-    const kd = [[11, 8], [9, 10], [8, 7], [10, 12], [7, 9], [9, 11], [6, 10]];
-    bots.forEach((b, i) => { b.kills = kd[i][0]; b.deaths = kd[i][1]; });
-    placeAgentsForShot();
-    camera.position.set(-26, 3.2, 6);
-    camera.rotation.set(0, -Math.PI / 2 - 0.15, 0);
-    endMatch();
-  }
-}
-function placeAgentsForShot() {
-  player.resetRound(SPAWNS.strike[0], -Math.PI / 2);
-  bots.forEach((b, i) => {
-    const spawn = b.team === 'strike' ? SPAWNS.strike[i + 1] : SPAWNS.aegis[i - 3];
-    b.resetRound(spawn[0], spawn[1], b.team === 'strike' ? -Math.PI / 2 : Math.PI / 2, 'AR7', true);
-    b.mesh.position.set(spawn[0], 0, spawn[1]);
-  });
-  camera.position.set(-28, EYE(), 0);
-  camera.rotation.set(0, -Math.PI / 2, 0);
-}
-function EYE() { return 1.62; }
 
-applyShotMode();
-updateHud();
+  // ---- HUD ----
+  setBanner(main, sub) {
+    $('bannerMain').textContent = main;
+    $('bannerSub').textContent = sub || '';
+    $('banner').classList.remove('hidden');
+    this.bannerT = 3.2;
+    if (this.bannerTimer) clearTimeout(this.bannerTimer);
+    this.bannerTimer = setTimeout(() => $('banner').classList.add('hidden'), 3200);
+  }
 
-// ---- main loop: fixed-step sim, render apart ----
-let last = performance.now();
-let acc = 0;
-const STEP = 1 / 60;
-function frame(now) {
-  requestAnimationFrame(frame);
-  let dt = (now - last) / 1000;
-  last = now;
-  if (dt > 0.25) dt = 0.25;
-  acc += dt;
-  let n = 0;
-  while (acc >= STEP && n < 5) { sim(STEP); acc -= STEP; n += 1; }
-  if (n === 5) acc = 0;
-  for (const line of tracers) {
-    if (line.userData.life > 0) {
-      line.userData.life -= dt;
-      line.material.opacity = Math.max(0, line.userData.life / 0.08) * 0.9;
+  feed(text) {
+    this.killfeed.unshift({ text, t: this.time });
+    if (this.killfeed.length > 5) this.killfeed.pop();
+    $('killfeed').innerHTML = this.killfeed.map((k) => `<div>${k.text}</div>`).join('');
+  }
+
+  flashHitmarker(head) {
+    const hm = $('hitmarker');
+    hm.classList.remove('hidden');
+    hm.style.color = head ? '#ff5040' : '#ffffff';
+    clearTimeout(this.hmTimer);
+    this.hmTimer = setTimeout(() => hm.classList.add('hidden'), 120);
+  }
+
+  updateHUD() {
+    const p = this.player;
+    $('scoreStrike').textContent = this.score.STRIKE;
+    $('scoreAegis').textContent = this.score.AEGIS;
+    $('roundNum').textContent = this.phase === 'menu' ? '—' : this.round;
+    const t = Math.max(0, Math.ceil(this.phaseT));
+    $('timer').textContent = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+    $('phaseLabel').textContent = { menu: 'MENU', buy: 'BUY PHASE', live: 'LIVE', roundEnd: 'ROUND OVER', matchEnd: 'MATCH OVER' }[this.phase];
+    $('hp').textContent = Math.ceil(p.hp);
+    $('hp').style.color = p.hp > 50 ? '#7ee787' : p.hp > 25 ? '#ffb020' : '#ff5040';
+    $('armor').textContent = p.armor ? 'KEVLAR' : '—';
+    $('money').textContent = '$' + p.money;
+    $('weaponName').textContent = p.weapon.name;
+    const a = p.ammo[p.weaponKey];
+    $('ammoMag').textContent = p.reloading > 0 ? '––' : a.mag;
+    $('ammoRes').textContent = a.reserve;
+    $('grenades').textContent = '✦'.repeat(p.grenades);
+    const site = this.inSite(p.pos);
+    const b = this.bomb;
+    $('bombStatus').textContent = b.planted ? `CHARGE LIVE ${Math.ceil(b.fuse)}s`
+      : b.carrier === 'player' ? (site ? 'HOLD E TO PLANT' : 'CARRYING CHARGE — reach a site')
+      : b.dropped ? 'CHARGE DROPPED' : (b.carrier !== null ? `${this.bots[b.carrier]?.name ?? ''} HAS THE CHARGE` : '—');
+    // Plant / defuse progress bar.
+    const prog = b.planted ? (40 - b.fuse) / 40 : clamp(b.plantT / 3, 0, 1);
+    $('plantFill').style.width = `${prog * 100}%`;
+    $('plantBar').classList.toggle('hidden', !(b.planted || b.plantT > 0));
+    // Dynamic crosshair: gap grows with spread.
+    const gap = 4 + p.spreadNow() * 900;
+    document.documentElement.style.setProperty('--xgap', `${gap}px`);
+    $('crosshair').classList.toggle('hidden', this.phase === 'menu' || !p.alive);
+    // Buy menu prices / affordability.
+    for (const el of document.querySelectorAll('[data-buy]')) {
+      const key = el.dataset.buy;
+      const price = key === 'KEVLAR' ? KEVLAR_PRICE : key === 'GRENADE' ? 300 : WEAPONS[key].price;
+      el.querySelector('.price').textContent = '$' + price;
+      el.classList.toggle('cant', p.money < price || (key !== 'KEVLAR' && key !== 'GRENADE' && p.weapons.includes(key)));
     }
   }
-  renderer.render(scene, camera);
-}
-requestAnimationFrame(frame);
 
-window.__game = { G, player, bots, bomb, version: 'sunder-2' };
+  openBuy(open) {
+    this.buyOpen = open;
+    $('buyMenu').classList.toggle('hidden', !open);
+  }
+
+  // ---- Input ----
+  bindInput() {
+    const c = this.renderer.domElement;
+    addEventListener('keydown', (e) => {
+      if (e.repeat) return;
+      const k = e.key.toLowerCase();
+      if (k === 'w' || k === 'arrowup') this.keys.f = true;
+      if (k === 's' || k === 'arrowdown') this.keys.b = true;
+      if (k === 'a' || k === 'arrowleft') this.keys.l = true;
+      if (k === 'd' || k === 'arrowright') this.keys.r = true;
+      if (k === ' ') { this.keys.jump = true; e.preventDefault(); }
+      if (k === 'control' || k === 'c') this.keys.crouch = true;
+      if (k === 'shift') this.keys.walk = true;
+      if (k === 'r') { if (this.player.reload()) this.sfx.reload(); }
+      if (k === 'e') this.plantHeld = true;
+      if (k === 'g') this.throwGrenade();
+      if (k === 'b' && (this.phase === 'buy' || this.phase === 'live')) {
+        this.openBuy(!this.buyOpen);
+        if (this.buyOpen) document.exitPointerLock?.();
+      }
+      if (k === '1') this.player.switchSlot(0);
+      if (k === '2') this.player.switchSlot(1);
+      if (k === '3') this.player.switchSlot(2);
+      if (this.buyOpen) {
+        if (k === '4') this.buyItem('VK9');
+        if (k === '5') this.buyItem('AR7');
+        if (k === '6') this.buyItem('LONGSHOT');
+        if (k === '7') this.buyItem('KEVLAR');
+        if (k === '8') this.buyItem('GRENADE');
+      }
+    });
+    addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'w' || k === 'arrowup') this.keys.f = false;
+      if (k === 's' || k === 'arrowdown') this.keys.b = false;
+      if (k === 'a' || k === 'arrowleft') this.keys.l = false;
+      if (k === 'd' || k === 'arrowright') this.keys.r = false;
+      if (k === ' ') this.keys.jump = false;
+      if (k === 'control' || k === 'c') this.keys.crouch = false;
+      if (k === 'shift') this.keys.walk = false;
+      if (k === 'e') this.plantHeld = false;
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement !== c || !this.player.alive) return;
+      this.player.yaw -= e.movementX * 0.0022;
+      this.player.pitch = clamp(this.player.pitch - e.movementY * 0.0022, -1.5, 1.5);
+    });
+    c.addEventListener('mousedown', (e) => {
+      this.sfx.ensure();
+      if (this.phase !== 'live' || !this.player.alive) return;
+      if (document.pointerLockElement !== c) { c.requestPointerLock()?.catch?.(() => {}); return; }
+      if (e.button === 0) this.firing = true;
+      if (e.button === 2) this.player.scoped = this.player.weaponKey === 'LONGSHOT';
+    });
+    addEventListener('mouseup', (e) => { if (e.button === 0) this.firing = false; if (e.button === 2) this.player.scoped = false; });
+    c.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  buyItem(key) {
+    let ok = false;
+    if (key === 'KEVLAR') ok = this.player.buyKevlar();
+    else if (key === 'GRENADE') ok = this.player.buyGrenade();
+    else ok = this.player.buy(key);
+    if (ok) { this.sfx.beep(); this.updateHUD(); }
+    return ok;
+  }
+
+  bindUI() {
+    $('deployBtn').addEventListener('click', () => {
+      this.sfx.ensure();
+      $('menu').classList.add('hidden');
+      this.renderer.domElement.requestPointerLock?.()?.catch?.(() => {});
+      this.startMatch();
+    });
+    $('againBtn').addEventListener('click', () => {
+      $('endScreen').classList.add('hidden');
+      $('menu').classList.remove('hidden');
+      this.phase = 'menu';
+      this.updateHUD();
+    });
+    for (const el of document.querySelectorAll('[data-buy]')) {
+      el.addEventListener('click', () => this.buyItem(el.dataset.buy));
+    }
+  }
+}
+
+// ---- Boot + deterministic render modes ----
+const game = new Game();
+window.__sunder = game; // dev hook for smoke tests (not part of play)
+if (SHOT === 'play') {
+  $('menu').classList.add('hidden');
+  game.startMatch();
+  game.phase = 'live'; game.phaseT = ROUND_TIME; game.openBuy(false);
+  // Put the fight on screen: bots converge on mid, player watches the gap.
+  game.player.spawn(new THREE.Vector3(-6, 0, 0), -Math.PI / 2);
+  for (const b of game.bots) {
+    const mid = b.team === 'STRIKE' ? new THREE.Vector3(-4, 0, 2) : new THREE.Vector3(4, 0, -2);
+    b.spawn(mid, b.team === 'STRIKE' ? -Math.PI / 2 : Math.PI / 2);
+    b.decide(game.botCtx());
+  }
+} else if (SHOT === 'end') {
+  $('menu').classList.add('hidden');
+  game.score = { STRIKE: 9, AEGIS: 4 };
+  game.round = 13;
+  game.player.kills = 18; game.player.deaths = 9;
+  game.bots[0].kills = 11; game.bots[0].deaths = 8;
+  game.bots[3].kills = 12; game.bots[3].deaths = 10;
+  game.endMatch('STRIKE');
+}
+(function loop() { requestAnimationFrame(loop); game.frame(); })();
+

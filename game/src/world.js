@@ -1,316 +1,217 @@
-// SUNDER — world.js
-// The map, its colliders, raycasts and bot navigation. One job: geometry + queries.
-// Map: 64 x 48 m. x in [-32, 32], z in [-24, 24]. A site north-east, B site south-east,
-// a mid wall with a centre gap, long north/south corridors, crates for cover.
-// STRIKE spawns west, AEGIS east. All distances in metres, y up.
+// world.js — SUNDER map: one shared collider set drives movement, bullet
+// raycasts and bot line-of-sight, so what you see is what the sim uses.
+// Arena 64 x 48 (x -32..32, z -24..24). STRIKE spawns west, AEGIS east.
+// Mid wall splits the map with a centre gap; long corridors run north and
+// south; sites A (north-west) and B (south-east) are walled yards with
+// door gaps; crates give cover everywhere in between.
 import * as THREE from 'three';
 
-export const MAP_W = 64;
-export const MAP_D = 48;
-export const WALL_H = 3.4;
+// A solid is an axis-aligned box: [minX, maxX, minZ, maxZ, topY].
+// Walls are 4 high, crates 1.1–1.6 high.
+const WALL_H = 4;
+function box(x0, x1, z0, z1, h = WALL_H) { return [x0, x1, z0, z1, h]; }
 
-export function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// Full-height walls: {x0, z0, x1, z1}
-export const WALLS = [
-  // outer ring
-  { x0: -33, z0: -25, x1: 33, z1: -24 },
-  { x0: -33, z0: 24, x1: 33, z1: 25 },
-  { x0: -33, z0: -24, x1: -32, z1: 24 },
-  { x0: 32, z0: -24, x1: 33, z1: 24 },
-  // mid wall, centre gap z in [-5, 5]
-  { x0: -0.75, z0: -24, x1: 0.75, z1: -5 },
-  { x0: -0.75, z0: 5, x1: 0.75, z1: 24 },
-  // A site (north-east): west wall with door gap z [-17.5, -14], south wall gap x [21, 24]
-  { x0: 15.5, z0: -22, x1: 16.5, z1: -17.5 },
-  { x0: 15.5, z0: -14, x1: 16.5, z1: -10 },
-  { x0: 16.5, z0: -10.5, x1: 21, z1: -9.5 },
-  { x0: 24, z0: -10.5, x1: 32, z1: -9.5 },
-  // B site (south-east): west wall door gap z [14, 17.5], north wall gap x [21, 24]
-  { x0: 15.5, z0: 10, x1: 16.5, z1: 14 },
-  { x0: 15.5, z0: 17.5, x1: 16.5, z1: 22 },
-  { x0: 16.5, z0: 9.5, x1: 21, z1: 10.5 },
-  { x0: 24, z0: 9.5, x1: 32, z1: 10.5 },
-  // freestanding cover walls
-  { x0: -11, z0: -14, x1: -10, z1: -10 },
-  { x0: -11, z0: 10, x1: -10, z1: 14 },
-  { x0: 7, z0: -3, x1: 8, z1: 0.5 },
-  { x0: -8, z0: -0.5, x1: -7, z1: 3 },
+export const MAP = { halfX: 32, halfZ: 24, wallH: WALL_H };
+export const SITE_A = new THREE.Vector3(-16, 0, -15);
+export const SITE_B = new THREE.Vector3(16, 0, 15);
+export const SITE_R = 4.5;
+export const SPAWN_STRIKE = [
+  new THREE.Vector3(-29, 0, -3), new THREE.Vector3(-29, 0, 0),
+  new THREE.Vector3(-29, 0, 3), new THREE.Vector3(-27, 0, 0),
+];
+export const SPAWN_AEGIS = [
+  new THREE.Vector3(29, 0, -3), new THREE.Vector3(29, 0, 0),
+  new THREE.Vector3(29, 0, 3), new THREE.Vector3(27, 0, 0),
 ];
 
-// Crates: {x, z, s, h} — low cover, blocks movement and bullets.
-export const CRATES = [
-  { x: -4, z: -16, s: 2.0, h: 1.2 }, { x: -4, z: 16, s: 2.0, h: 1.2 },
-  { x: 4, z: -16, s: 2.0, h: 1.2 }, { x: 4, z: 16, s: 2.0, h: 1.2 },
-  { x: -16, z: -6, s: 2.0, h: 1.2 }, { x: -16, z: 6, s: 2.0, h: 1.2 },
-  { x: 12, z: -6, s: 2.0, h: 1.2 }, { x: 12, z: 6, s: 2.0, h: 1.2 },
-  { x: 20, z: -16, s: 2.4, h: 1.2 }, { x: 20, z: 16, s: 2.4, h: 1.2 },
-  { x: -24, z: -12, s: 2.0, h: 1.2 }, { x: -24, z: 12, s: 2.0, h: 1.2 },
-  { x: 26, z: -6, s: 2.0, h: 1.2 }, { x: 26, z: 6, s: 2.0, h: 1.2 },
-  { x: -27, z: 0, s: 2.4, h: 1.2 },
-];
+function buildSolids() {
+  const s = [];
+  // Perimeter.
+  s.push(box(-33, 33, -25, -24), box(-33, 33, 24, 25));
+  s.push(box(-33, -32, -24, 24), box(32, 33, -24, 24));
+  // Mid wall at x = 0 with a centre gap (z -4..4 open).
+  s.push(box(-0.5, 0.5, -24, -4), box(-0.5, 0.5, 4, 24));
+  // Site A yard (north-west): walls with a door gap on the east side
+  // (z -16..-12) and on the south side (x -14..-10).
+  s.push(box(-24, -8, -22, -21));            // north wall
+  s.push(box(-24, -23, -22, -8));            // west wall
+  s.push(box(-8, -7, -22, -16), box(-8, -7, -12, -8)); // east wall, gap
+  s.push(box(-24, -14, -8, -7), box(-10, -8, -8, -7)); // south wall, gap
+  // Site B yard (south-east): door gap on the west side (z 12..16) and
+  // on the north side (x 10..14).
+  s.push(box(8, 24, 21, 22));                // south wall
+  s.push(box(23, 24, 8, 22));                // east wall
+  s.push(box(7, 8, 8, 12), box(7, 8, 16, 22)); // west wall, gap
+  s.push(box(8, 10, 7, 8), box(14, 24, 7, 8)); // north wall, gap
+  // Long-corridor cover: low blocks hugging the north and south lanes.
+  s.push(box(-12, -8, -21, -19, 1.4), box(8, 12, -21, -19, 1.4));
+  s.push(box(-12, -8, 19, 21, 1.4), box(8, 12, 19, 21, 1.4));
+  // Mid crates — the crossfire cover both teams play around. Kept clear of
+  // the centre-gap corridor (x -4..4, z -4..4) so the waypoint graph stays
+  // connected across the mid wall.
+  s.push(box(-7, -4, 5, 8, 1.2), box(4, 7, -8, -5, 1.2));
+  s.push(box(-4, -1, 8, 11, 1.5), box(1, 4, -11, -8, 1.5));
+  s.push(box(-18, -15, 2, 5, 1.2), box(15, 18, -5, -2, 1.2));
+  s.push(box(-10, -7, -14, -11, 1.3), box(7, 10, 11, 14, 1.3));
+  return s;
+}
 
-// One collider list drives movement, bullet raycast and bot line-of-sight.
-export function buildColliders() {
-  const out = [];
-  for (const w of WALLS) out.push({ x0: w.x0, z0: w.z0, x1: w.x1, z1: w.z1, y0: 0, y1: WALL_H });
-  for (const c of CRATES) {
-    const h = c.s / 2;
-    out.push({ x0: c.x - h, z0: c.z - h, x1: c.x + h, z1: c.z + h, y0: 0, y1: c.h });
+export const SOLIDS = buildSolids();
+
+// 2D point-in-solid test (movement uses the XZ footprint).
+export function blockedAt(x, z, r = 0.4) {
+  for (const b of SOLIDS) {
+    if (x + r > b[0] && x - r < b[1] && z + r > b[2] && z - r < b[3]) return true;
   }
-  return out;
+  return Math.abs(x) > MAP.halfX - r || Math.abs(z) > MAP.halfZ - r;
 }
 
-export const SITES = {
-  A: { x0: 18, z0: -20, x1: 28, z1: -12, cx: 23, cz: -16 },
-  B: { x0: 18, z0: 12, x1: 28, z1: 20, cx: 23, cz: 16 },
-};
-
-export const SPAWNS = {
-  strike: [[-28, 0], [-28, -3], [-28, 3], [-26, -1.5]],
-  aegis: [[28, 0], [28, -3], [28, 3], [26, 1.5]],
-};
-
-export function inSite(site, x, z) {
-  return x >= site.x0 && x <= site.x1 && z >= site.z0 && z <= site.z1;
+// Slide a circle (player/bot) along X then Z, stopping at solids.
+export function moveCircle(p, dx, dz, r = 0.4) {
+  const nx = p.x + dx;
+  if (!blockedAt(nx, p.z, r)) p.x = nx;
+  const nz = p.z + dz;
+  if (!blockedAt(p.x, nz, r)) p.z = nz;
+  p.x = Math.max(-MAP.halfX + r, Math.min(MAP.halfX - r, p.x));
+  p.z = Math.max(-MAP.halfZ + r, Math.min(MAP.halfZ - r, p.z));
 }
 
-// ---- 2D collision: circle vs expanded AABBs, axis-separated so agents slide ----
-export function circleHits(x, z, r, colliders) {
-  for (const c of colliders) {
-    if (x >= c.x0 - r && x <= c.x1 + r && z >= c.z0 - r && z <= c.z1 + r) return true;
+// Ray vs solids (slab test) + floor plane. Returns { dist, point } or null.
+export function raycast(origin, dir, maxDist = 200) {
+  let best = null;
+  if (dir.y < -1e-6) {
+    const t = -origin.y / dir.y;
+    if (t > 0 && t < maxDist) best = { dist: t, point: origin.clone().addScaledVector(dir, t) };
   }
-  return false;
-}
-
-export function moveCircle(px, pz, dx, dz, r, colliders) {
-  let nx = px + dx;
-  if (circleHits(nx, pz, r, colliders)) nx = px;
-  let nz = pz + dz;
-  if (circleHits(nx, nz, r, colliders)) nz = pz;
-  return { x: nx, z: nz };
-}
-
-// ---- 3D ray vs colliders: nearest t in [0, maxDist], or -1 ----
-export function rayHit(ox, oy, oz, dx, dy, dz, maxDist, colliders) {
-  let best = maxDist;
-  for (const c of colliders) {
-    let t0 = 0, t1 = best;
+  for (const b of SOLIDS) {
+    let tmin = 0, tmax = maxDist;
+    const o = [origin.x, origin.y, origin.z], d = [dir.x, dir.y, dir.z];
+    const mn = [b[0], 0, b[2]], mx = [b[1], b[4], b[3]];
     let ok = true;
-    const axes = [
-      [ox, dx, c.x0, c.x1],
-      [oy, dy, c.y0, c.y1],
-      [oz, dz, c.z0, c.z1],
-    ];
-    for (const [o, d, lo, hi] of axes) {
-      if (Math.abs(d) < 1e-9) {
-        if (o < lo || o > hi) { ok = false; break; }
-      } else {
-        let ta = (lo - o) / d, tb = (hi - o) / d;
-        if (ta > tb) { const t = ta; ta = tb; tb = t; }
-        if (ta > t0) t0 = ta;
-        if (tb < t1) t1 = tb;
-        if (t0 > t1) { ok = false; break; }
+    for (let i = 0; i < 3; i++) {
+      if (Math.abs(d[i]) < 1e-9) { if (o[i] < mn[i] || o[i] > mx[i]) { ok = false; break; } }
+      else {
+        let t1 = (mn[i] - o[i]) / d[i], t2 = (mx[i] - o[i]) / d[i];
+        if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+        if (t1 > tmin) tmin = t1;
+        if (t2 < tmax) tmax = t2;
+        if (tmin > tmax) { ok = false; break; }
       }
     }
-    if (ok && t0 < best && t1 >= 0) best = Math.max(t0, 0);
-  }
-  return best < maxDist ? best : -1;
-}
-
-// ---- 2D segment vs AABBs expanded by `clear` (waypoint edges, movement checks) ----
-export function segmentClear(ax, az, bx, bz, clear, colliders) {
-  const dx = bx - ax, dz = bz - az;
-  for (const c of colliders) {
-    const x0 = c.x0 - clear, x1 = c.x1 + clear, z0 = c.z0 - clear, z1 = c.z1 + clear;
-    let t0 = 0, t1 = 1, ok = true;
-    const axes = [[ax, dx, x0, x1], [az, dz, z0, z1]];
-    for (const [o, d, lo, hi] of axes) {
-      if (Math.abs(d) < 1e-9) {
-        if (o < lo || o > hi) { ok = false; break; }
-      } else {
-        let ta = (lo - o) / d, tb = (hi - o) / d;
-        if (ta > tb) { const t = ta; ta = tb; tb = t; }
-        if (ta > t0) t0 = ta;
-        if (tb < t1) t1 = tb;
-        if (t0 > t1) { ok = false; break; }
-      }
+    if (ok && tmin > 0.001 && tmin < maxDist && (!best || tmin < best.dist)) {
+      best = { dist: tmin, point: origin.clone().addScaledVector(dir, tmin) };
     }
-    if (ok) return false;
-  }
-  return true;
-}
-
-export function hasLOS(ax, ay, az, bx, by, bz, colliders) {
-  const dx = bx - ax, dy = by - ay, dz = bz - az;
-  const dist = Math.hypot(dx, dy, dz);
-  if (dist < 1e-6) return true;
-  const t = rayHit(ax, ay, az, dx / dist, dy / dist, dz / dist, dist - 0.05, colliders);
-  return t === -1;
-}
-
-// ---- Waypoint graph + BFS (bots only; built once per match) ----
-export function buildGraph(colliders) {
-  const nodes = [];
-  const add = (x, z) => {
-    if (!circleHits(x, z, 0.7, colliders)) nodes.push({ x, z });
-  };
-  for (let x = -28; x <= 28; x += 4) {
-    for (let z = -20; z <= 20; z += 4) add(x, z);
-  }
-  // Door gaps and site interiors the 4 m grid misses.
-  add(16, -15.75); add(16, 15.75); // site west doors
-  add(22.5, -10); add(22.5, 10);   // site south/north gaps
-  add(0, -4); add(0, 4);           // mid gap
-  add(23, -16); add(23, 16);       // site centres
-  const adj = nodes.map(() => []);
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
-      const a = nodes[i], b = nodes[j];
-      const d = Math.hypot(a.x - b.x, a.z - b.z);
-      if (d <= 5.2 && segmentClear(a.x, a.z, b.x, b.z, 0.55, colliders)) {
-        adj[i].push({ to: j, cost: d });
-        adj[j].push({ to: i, cost: d });
-      }
-    }
-  }
-  return { nodes, adj };
-}
-
-function nearestNode(graph, x, z) {
-  let best = -1, bd = Infinity;
-  for (let i = 0; i < graph.nodes.length; i++) {
-    const n = graph.nodes[i];
-    const d = (n.x - x) * (n.x - x) + (n.z - z) * (n.z - z);
-    if (d < bd) { bd = d; best = i; }
   }
   return best;
 }
 
-export function findPath(graph, sx, sz, tx, tz) {
-  const si = nearestNode(graph, sx, sz);
-  const ti = nearestNode(graph, tx, tz);
-  if (si < 0 || ti < 0) return null;
-  if (si === ti) return [{ x: tx, z: tz }];
-  const prev = new Array(graph.nodes.length).fill(-1);
-  const queue = [si];
-  prev[si] = si;
-  while (queue.length) {
-    const cur = queue.shift();
-    if (cur === ti) break;
-    for (const e of graph.adj[cur]) {
-      if (prev[e.to] === -1) { prev[e.to] = cur; queue.push(e.to); }
+// True when nothing solid sits between two eye points.
+export function hasLOS(a, b) {
+  const d = b.clone().sub(a);
+  const len = d.length();
+  if (len < 0.01) return true;
+  d.divideScalar(len);
+  const hit = raycast(a, d, len - 0.15);
+  return !hit;
+}
+
+// ---- Waypoint graph + BFS (bots navigate the same map the player runs) ----
+const STEP = 4;
+function gridKey(ix, iz) { return ix + ',' + iz; }
+
+export function buildWaypoints() {
+  const nodes = new Map();
+  for (let ix = -7; ix <= 7; ix++) for (let iz = -5; iz <= 5; iz++) {
+    const x = ix * STEP, z = iz * STEP;
+    if (blockedAt(x, z, 0.7)) continue;
+    nodes.set(gridKey(ix, iz), { ix, iz, x, z, links: [] });
+  }
+  const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+  for (const n of nodes.values()) {
+    for (const [dx, dz] of dirs) {
+      const m = nodes.get(gridKey(n.ix + dx, n.iz + dz));
+      if (!m) continue;
+      if (dx && dz) { // no cutting corners through a wall
+        if (!nodes.get(gridKey(n.ix + dx, n.iz)) || !nodes.get(gridKey(n.ix, n.iz + dz))) continue;
+      }
+      n.links.push(m);
     }
   }
-  if (prev[ti] === -1) return null;
-  const path = [];
-  let cur = ti;
-  while (cur !== si) { path.push(graph.nodes[cur]); cur = prev[cur]; }
-  path.reverse();
-  path.push({ x: tx, z: tz });
-  return path;
+  return nodes;
 }
 
-// ---- Rendering: floor, walls, crates, site paint, skyline silhouettes ----
-function letterTexture(letter, color) {
-  const cv = document.createElement('canvas');
-  cv.width = 256; cv.height = 256;
-  const g = cv.getContext('2d');
-  g.clearRect(0, 0, 256, 256);
-  g.fillStyle = color;
-  g.font = 'bold 200px system-ui, sans-serif';
-  g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.fillText(letter, 128, 138);
-  const tex = new THREE.CanvasTexture(cv);
-  tex.anisotropy = 4;
-  return tex;
+export function nearestNode(nodes, x, z) {
+  let best = null, bd = Infinity;
+  for (const n of nodes.values()) {
+    const d = (n.x - x) ** 2 + (n.z - z) ** 2;
+    if (d < bd) { bd = d; best = n; }
+  }
+  return best;
 }
 
-export function buildMap(scene) {
-  const colliders = buildColliders();
-  const matFloor = new THREE.MeshStandardMaterial({ color: 0x2b2e34, roughness: 0.95, metalness: 0.05 });
-  const matWall = new THREE.MeshStandardMaterial({ color: 0x3a3f47, roughness: 0.9, metalness: 0.08 });
-  const matWallSite = new THREE.MeshStandardMaterial({ color: 0x44403a, roughness: 0.9, metalness: 0.08 });
-  const matCrate = new THREE.MeshStandardMaterial({ color: 0x7a6238, roughness: 0.85, metalness: 0.1 });
-  const matCrateDark = new THREE.MeshStandardMaterial({ color: 0x4d4a42, roughness: 0.9, metalness: 0.05 });
+// BFS from a node to a target point; returns a list of {x,z} waypoints.
+export function findPath(nodes, from, tx, tz) {
+  const start = nearestNode(nodes, from.x, from.z);
+  const goal = nearestNode(nodes, tx, tz);
+  if (!start || !goal) return [{ x: tx, z: tz }];
+  const prev = new Map([[start, null]]);
+  const queue = [start];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur === goal) break;
+    for (const nb of cur.links) if (!prev.has(nb)) { prev.set(nb, cur); queue.push(nb); }
+  }
+  if (!prev.has(goal)) return [{ x: tx, z: tz }];
+  const out = [];
+  for (let n = goal; n; n = prev.get(n)) out.unshift({ x: n.x, z: n.z });
+  out.push({ x: tx, z: tz });
+  return out;
+}
 
-  const floor = new THREE.Mesh(new THREE.PlaneGeometry(MAP_W + 2, MAP_D + 2), matFloor);
+// ---- Scene dressing (visual only; colliders above are the truth) ----
+export function buildScene(scene) {
+  const matFloor = new THREE.MeshStandardMaterial({ color: 0x3d4149, roughness: 0.95 });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(66, 50), matFloor);
   floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
   scene.add(floor);
-
-  const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-  for (const w of WALLS) {
-    const m = new THREE.Mesh(boxGeo, (w.x0 >= 15.5) ? matWallSite : matWall);
-    m.scale.set(w.x1 - w.x0, WALL_H, w.z1 - w.z0);
-    m.position.set((w.x0 + w.x1) / 2, WALL_H / 2, (w.z0 + w.z1) / 2);
+  const matWall = new THREE.MeshStandardMaterial({ color: 0x59606e, roughness: 0.85 });
+  const matWallB = new THREE.MeshStandardMaterial({ color: 0x4a4f5c, roughness: 0.85 });
+  const matCrate = new THREE.MeshStandardMaterial({ color: 0x8a6d3b, roughness: 0.8 });
+  const matCrateB = new THREE.MeshStandardMaterial({ color: 0x5d7a52, roughness: 0.8 });
+  const geoBox = new THREE.BoxGeometry(1, 1, 1);
+  for (const b of SOLIDS) {
+    const w = b[1] - b[0], h = b[4], d = b[3] - b[2];
+    const m = new THREE.Mesh(geoBox, h >= WALL_H ? (Math.abs(b[0] + b[1]) < 2 ? matWallB : matWall) : (w > 2.5 ? matCrateB : matCrate));
+    m.scale.set(w, h, d);
+    m.position.set((b[0] + b[1]) / 2, h / 2, (b[2] + b[3]) / 2);
+    m.castShadow = true; m.receiveShadow = true;
     scene.add(m);
   }
-  CRATES.forEach((c, i) => {
-    const m = new THREE.Mesh(boxGeo, i % 2 ? matCrate : matCrateDark);
-    m.scale.set(c.s, c.h, c.s);
-    m.position.set(c.x, c.h / 2, c.z);
-    scene.add(m);
-    const lid = new THREE.Mesh(boxGeo, matCrateDark);
-    lid.scale.set(c.s * 0.92, 0.08, c.s * 0.92);
-    lid.position.set(c.x, c.h + 0.04, c.z);
-    scene.add(lid);
-  });
-
-  // Site floor paint + big letters.
-  for (const [key, s] of Object.entries(SITES)) {
-    const tint = new THREE.Mesh(
-      new THREE.PlaneGeometry(s.x1 - s.x0, s.z1 - s.z0),
-      new THREE.MeshBasicMaterial({
-        color: key === 'A' ? 0xf0a830 : 0x35c4b5, transparent: true, opacity: 0.10, depthWrite: false,
-      }),
+  // Site markers: glowing floor rings so the objective reads at a glance.
+  for (const [site, color] of [[SITE_A, 0xffb020], [SITE_B, 0x20c8ff]]) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(SITE_R - 0.35, SITE_R, 40),
+      new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.75 }),
     );
-    tint.rotation.x = -Math.PI / 2;
-    tint.position.set(s.cx, 0.02, s.cz);
-    scene.add(tint);
-    const letter = new THREE.Mesh(
-      new THREE.PlaneGeometry(5, 5),
-      new THREE.MeshBasicMaterial({
-        map: letterTexture(key, key === 'A' ? '#f0a830' : '#35c4b5'),
-        transparent: true, opacity: 0.55, depthWrite: false,
-      }),
-    );
-    letter.rotation.x = -Math.PI / 2;
-    letter.position.set(s.cx, 0.03, s.cz);
-    scene.add(letter);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(site.x, 0.02, site.z);
+    scene.add(ring);
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 3.2, 8),
+      new THREE.MeshBasicMaterial({ color }));
+    pole.position.set(site.x, 1.6, site.z);
+    scene.add(pole);
   }
-
-  // Spawn pads.
-  const padS = new THREE.Mesh(new THREE.PlaneGeometry(7, 7),
-    new THREE.MeshBasicMaterial({ color: 0xf0a830, transparent: true, opacity: 0.08, depthWrite: false }));
-  padS.rotation.x = -Math.PI / 2; padS.position.set(-28, 0.02, 0); scene.add(padS);
-  const padA = new THREE.Mesh(new THREE.PlaneGeometry(7, 7),
-    new THREE.MeshBasicMaterial({ color: 0x35c4b5, transparent: true, opacity: 0.08, depthWrite: false }));
-  padA.rotation.x = -Math.PI / 2; padA.position.set(28, 0.02, 0); scene.add(padA);
-
-  // Mid stripe.
-  const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.5, MAP_D),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.05, depthWrite: false }));
-  stripe.rotation.x = -Math.PI / 2; stripe.position.set(0, 0.015, 0); scene.add(stripe);
-
-  // Distant skyline silhouettes so the horizon is not void.
-  const matSky = new THREE.MeshStandardMaterial({ color: 0x1c1f26, roughness: 1 });
-  const rng = mulberry32(99);
-  for (let i = 0; i < 14; i++) {
-    const a = (i / 14) * Math.PI * 2 + rng() * 0.3;
-    const r = 52 + rng() * 22;
-    const w = 6 + rng() * 10, h = 8 + rng() * 22;
-    const m = new THREE.Mesh(boxGeo, matSky);
-    m.scale.set(w, h, w);
-    m.position.set(Math.cos(a) * r, h / 2, Math.sin(a) * r);
-    scene.add(m);
-  }
-  return colliders;
+  // Site letters on a canvas texture (no network).
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 64;
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#20242c'; g.fillRect(0, 0, 256, 64);
+  g.fillStyle = '#ffb020'; g.font = 'bold 44px sans-serif'; g.textAlign = 'center';
+  g.fillText('A', 64, 50); g.fillStyle = '#20c8ff'; g.fillText('B', 192, 50);
+  const tex = new THREE.CanvasTexture(canvas);
+  const sign = new THREE.Mesh(new THREE.PlaneGeometry(8, 2),
+    new THREE.MeshBasicMaterial({ map: tex }));
+  sign.position.set(0, 3.4, -24.4);
+  scene.add(sign);
 }
